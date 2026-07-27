@@ -26,6 +26,7 @@ OSAPI="${HERE}/osapi"
 
 MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
 PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+ZEEK_MOUNT="${ZEEK_MOUNT:-//d/malcolm-data/zeek-logs}"
 MONITOR_CONTAINER="${MONITOR_CONTAINER:-malcolm-pcap-monitor-1}"
 SENSOR_CONTAINER="${SENSOR_CONTAINER:-er4-sensor}"
 STALL_SECS="${STALL_SECS:-420}"
@@ -66,5 +67,66 @@ if [[ -n "${newest:-}" && "${newest:-0}" -gt 0 ]]; then
     fi
   fi
 fi
+
+# Queue-age checks. The pipeline is a chain of spool directories, each drained
+# by a watcher process, and EVERY one of those watchers has been observed to
+# stop silently while alive and healthy. Checking only one stage misses the
+# others - this was learned by fixing the pcap publisher and then finding
+# filebeat's zeek-tarball extractor stalled in exactly the same way.
+#
+# Depth alone is a bad signal: a deep queue that is moving is fine. The age of
+# the OLDEST pending item is the honest one - if nothing has drained the head of
+# the queue in STALL_SECS, that stage is stuck.
+check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
+  local label="$1" mount="$2" dir="$3" svc="$4"
+  local oldest count
+  # Age comes from the capture timestamp in the FILENAME, not mtime. mtime is
+  # not trustworthy here: touching a stuck file resets it, which hides the stall
+  # from this very check while the file remains stuck. (Learned the hard way -
+  # touch also does not unstick it, see GOTCHAS.)
+  read -r count oldest < <(docker run --rm -v "${mount}:/q" alpine sh -c \
+    "ls -1 /q/${dir} 2>/dev/null | wc -l
+     for f in \$(ls -1 /q/${dir} 2>/dev/null); do
+       b=\$(basename \"\$f\"); case \"\$b\" in
+         *20[0-9][0-9][0-9][0-9][0-9][0-9]-[0-9][0-9][0-9][0-9][0-9][0-9]*)
+           echo \"\$b\" | sed 's/.*\\(20[0-9]\\{6\\}\\)-\\([0-9]\\{6\\}\\).*/\\1\\2/' ;;
+         *) date -u -r \"\$f\" +%Y%m%d%H%M%S 2>/dev/null || stat -c %Y \"\$f\" ;;
+       esac
+     done | sort | head -1" 2>/dev/null | paste -sd' ')
+  [[ -z "${oldest:-}" || "${#oldest}" -ne 14 ]] && return 0
+  local oldest_epoch age
+  oldest_epoch=$(date -u -d "${oldest:0:8} ${oldest:8:2}:${oldest:10:2}:${oldest:12:2}" +%s 2>/dev/null) || return 0
+  age=$(( $(date -u +%s) - oldest_epoch ))
+  [[ "$age" -le "$STALL_SECS" ]] && return 0
+
+  # A deep queue is not the same as a stopped one. After a stall the backlog can
+  # be hours old while the consumer works through it perfectly well - restarting
+  # then is actively harmful: each restart costs the startup delay and drops
+  # whatever was in flight, so a 5-minute heal loop can keep a queue permanently
+  # backlogged. Only restart when nothing is draining.
+  local drained
+  drained=$(docker logs --since 5m "$(drain_container "$svc")" 2>&1 | grep -cE '🖅|📫' || true)
+  if [[ "${drained:-0}" -gt 0 ]]; then
+    report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; draining - ${drained} events/5m, not restarting)"
+    return 0
+  fi
+
+  report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, no drain activity)"
+  if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
+    echo "  healing: restarting ${svc}"
+    (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
+  fi
+}
+
+drain_container() { # map a compose service to its container name
+  case "$1" in
+    filebeat)     echo "malcolm-filebeat-1" ;;
+    pcap-monitor) echo "$MONITOR_CONTAINER" ;;
+    *)            echo "malcolm-${1}-1" ;;
+  esac
+}
+
+check_queue "pcap/upload"      "$PCAP_MOUNT" "upload/*.pcap"    "pcap-monitor"
+check_queue "zeek-logs/upload" "$ZEEK_MOUNT" "upload/*.tar.gz" "filebeat"
 
 exit $(( problems > 0 ))

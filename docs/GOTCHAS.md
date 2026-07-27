@@ -150,6 +150,36 @@ file ran 900s ahead of the last publish. `--heal` restarts the container.
 them. Only re-queue files the publisher never announced, or you will duplicate
 sessions; the last `📫` line in its log tells you where it stopped.
 
+### Files already in a spool directory are never picked up
+The upload watchers act on **created** events only. A capture that is already
+sitting in `pcap/upload` when the watcher starts is logged and then ignored
+forever — the debug line shows `➋` (modified) where a healthy file shows `➊`
+(created), and the `👓`/`🖅` move lines never follow.
+
+`touch` does **not** fix it. Touching produces another *modified* event, so the
+file stays stuck — and worse, it resets the mtime, which hides the backlog from
+any age check based on mtime. Make the file genuinely new instead:
+
+```sh
+mkdir -p /pcap/requeue
+mv /pcap/upload/*.pcap /pcap/requeue/ && sleep 20 && mv /pcap/requeue/*.pcap /pcap/upload/
+```
+
+Found 13 captures from the first hour of operation still sitting unprocessed
+five hours later. For the same reason, queue-age checks should derive age from
+the **capture timestamp in the filename**, not from mtime.
+
+### A deep queue and a stopped queue need different responses
+After any stall the backlog can be hours old while the consumer works through it
+perfectly well. Restarting *then* is actively harmful — each restart costs the
+container's startup delay and drops whatever was in flight, so a watchdog on a
+5-minute heal loop can keep a queue permanently backlogged and never let it
+catch up. That is a self-inflicted outage.
+
+Check for drain activity before restarting anything: if the consumer has logged
+extract/publish events recently, it is working — report the backlog and leave it
+alone. Only restart when the queue is old **and** nothing is draining.
+
 ### Do not alert on a flat document count
 Two ways that false-positives: an idle network legitimately indexes nothing, and
 a **date-pinned index name** (`arkime_sessions3-260727`) stops growing at every
