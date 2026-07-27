@@ -180,6 +180,35 @@ Check for drain activity before restarting anything: if the consumer has logged
 extract/publish events recently, it is working — report the backlog and leave it
 alone. Only restart when the queue is old **and** nothing is draining.
 
+### A stuck head has two causes needing opposite repairs
+Check "is the consumer emitting anything at all" **before** "has the head
+moved", or you will apply the wrong repair:
+
+| consumer events | meaning | repair |
+|---|---|---|
+| none | the watcher has wedged | restart it |
+| flowing | created-events trap | re-queue the strays |
+
+Getting the order backwards re-queues files at a dead consumer. That is a no-op
+— nothing is left to notice the new files — and it reads as "the repair failed"
+rather than "the repair was wrong". `tools/watchdog` checks drain activity
+first for exactly this reason.
+
+The correct sequence when both are true is: restart, confirm the consumer is
+emitting again, *then* re-queue. After a restart the stranded files are
+pre-existing to the fresh watcher, so they need the re-queue anyway.
+
+### Expect these stalls to recur
+Four separate silent stalls were observed in one evening across `pcap-monitor`
+(twice), its publisher, and `filebeat`. Container restart counts stayed at
+**0** throughout — the containers never died, only the watcher threads inside
+them stopped. This is not a one-off to fix and forget; run the watchdog on a
+timer and let it heal.
+
+Correlated with sustained memory pressure (~500 MiB free of 21 GiB, several GiB
+swapped). Whether that is cause or coincidence is unproven, but it is the
+obvious suspect and worth ruling out before chasing anything subtler.
+
 ### Do not alert on a flat document count
 Two ways that false-positives: an idle network legitimately indexes nothing, and
 a **date-pinned index name** (`arkime_sessions3-260727`) stops growing at every

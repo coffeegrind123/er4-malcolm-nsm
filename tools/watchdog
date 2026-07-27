@@ -111,11 +111,31 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
   local drained
   drained=$(docker logs --since 5m "$(drain_container "$svc")" 2>&1 | grep -cE '🖅|📫' || true)
 
-  # ...but "draining" is not the same as "making progress". The watchers only
-  # act on *created* events, so anything already present when one starts is
-  # skipped forever while new arrivals sail past it. The queue then looks busy
-  # and healthy - events flowing, count roughly stable - with a permanently
-  # stranded head. 68 tarballs sat like that for four hours.
+  # ORDER MATTERS HERE. A stuck head has two different causes needing opposite
+  # repairs, and the discriminator is whether the consumer is doing anything at
+  # all:
+  #
+  #   no events at all  -> the watcher has wedged      -> restart it
+  #   events flowing    -> created-events trap         -> re-queue the strays
+  #
+  # Getting this backwards re-queues files at a dead consumer, which changes
+  # nothing and looks like the repair failed. (It did exactly that once: the
+  # mover had silently stopped for the third time, and re-queuing was a no-op
+  # because nothing was left to notice the new files.)
+  if [[ "${drained:-0}" -eq 0 ]]; then
+    report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, consumer produced no events)"
+    if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
+      echo "  healing: restarting ${svc}"
+      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
+    fi
+    return 0
+  fi
+
+  # Consumer is alive and emitting, but "draining" is not the same as "making
+  # progress". The watchers act on *created* events, so anything already present
+  # when one starts is skipped forever while new arrivals sail past it. The queue
+  # looks busy and healthy - events flowing, count roughly stable - with a
+  # permanently stranded head. 68 tarballs sat like that for four hours.
   #
   # The tell is the OLDEST entry never changing. Track it across runs.
   local state="${STATE_DIR}/$(echo "$label" | tr '/' '_').oldest"
@@ -144,11 +164,7 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
     return 0
   fi
 
-  report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, no drain activity)"
-  if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
-    echo "  healing: restarting ${svc}"
-    (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
-  fi
+  report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; head advancing)"
 }
 
 drain_container() { # map a compose service to its container name
