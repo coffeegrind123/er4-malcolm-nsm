@@ -1,0 +1,22 @@
+#!/usr/bin/env bash
+# Drive the Malcolm stack over HTTP.
+#
+# Everything sits behind the nginx reverse proxy on :443 with a self-signed
+# certificate and HTTP basic auth, hence -k plus credentials.
+#
+#   mapi /mapi/version                                  Malcolm API + cluster health
+#   mapi "/mapi/agg/dns.host?from=1 hour ago"           aggregate any field
+#   mapi "/arkime/api/sessions?length=20&date=-1"       Arkime sessions
+#   mapi "/arkime/api/connections?date=-1&srcField=source.ip&dstField=destination.ip"
+#   mapi "/dashboards/api/saved_objects/_find?type=dashboard&per_page=100"
+#
+# Extra arguments are passed through to curl.
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+BASE="${MALCOLM_BASE:-https://host.docker.internal}"
+USER_="${MALCOLM_USER:-admin}"
+PASS="$(cat "${MALCOLM_PW_FILE:-${HERE}/../keys/malcolm_pw}")"
+
+path="${1:-/mapi/version}"; shift || true
+exec curl -sk -u "${USER_}:${PASS}" "${BASE}${path}" "$@"

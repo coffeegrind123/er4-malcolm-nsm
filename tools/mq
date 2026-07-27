@@ -1,0 +1,15 @@
+#!/usr/bin/env bash
+# Fetch raw documents matching a JSON filter.
+#
+#   mq '{"event.dataset":"ssl"}' 20
+#   mq '{"source.ip":"192.168.1.100","event.dataset":"dns"}'
+#
+# Field note: aggregate with `mapi /mapi/agg/<field>`, but prefer
+# server.domain / zeek.ssl.server_name over tls.client.server_name - the latter
+# is mapped as text and silently returns zero buckets rather than an error.
+set -u
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+filter=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1")
+limit="${2:-10}"
+exec "${HERE}/mapi" "/mapi/document?limit=${limit}&filter=${filter}"

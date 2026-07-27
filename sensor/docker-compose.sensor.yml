@@ -1,0 +1,39 @@
+# EdgeRouter capture sensor.
+#
+# Run with:  docker compose --env-file ../config.env -f docker-compose.sensor.yml up -d
+#
+# Kept out of Malcolm's own compose project so capture can be restarted, retuned
+# or stopped without touching the analysis stack (and vice versa).
+#
+# The bind sources must be absolute host paths. Under Docker Desktop a relative
+# source resolves to a different, empty view of the filesystem - the sensor would
+# start happily and write its captures where nothing else can see them.
+services:
+  er4-sensor:
+    image: er4-sensor
+    build:
+      context: .
+    container_name: er4-sensor
+    restart: unless-stopped
+    environment:
+      ROUTER_HOST: "${ROUTER_HOST}"
+      ROUTER_USER: "${ROUTER_USER}"
+      IFACE: "${CAPTURE_IFACE}"
+      ROTATE_SECS: "${ROTATE_SECS}"
+      COLLECTOR_IP: "${COLLECTOR_IP}"
+      SNAPLEN: "${SNAPLEN}"
+      RBUF: "${RBUF}"
+      EXTRA_BPF: "${EXTRA_BPF:-}"
+    volumes:
+      - type: bind
+        source: ${KEYS_DIR_WIN}
+        target: /keys
+        read_only: true
+      - type: bind
+        source: ${DATA_ROOT_WIN}/pcap
+        target: /pcap
+    logging:
+      driver: json-file
+      options:
+        max-size: "10m"
+        max-file: "3"

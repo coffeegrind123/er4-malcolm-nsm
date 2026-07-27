@@ -1,0 +1,14 @@
+# Local settings and secrets - never commit these.
+config.env
+keys/
+*.pem
+*.key
+
+# Captures and indices
+*.pcap
+*.pcap.gz
+data/
+
+# Python
+__pycache__/
+*.pyc
