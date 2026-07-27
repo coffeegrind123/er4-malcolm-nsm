@@ -36,6 +36,28 @@ fi
 
 log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] $*"; }
 
+# Recover captures orphaned by a previous stop. tcpdump's -z hook only runs when
+# it rotates a file itself, so whatever it was writing when the container was
+# killed is stranded in staging forever - no process will ever move it, and the
+# traffic in it is simply lost. Sweep those into upload on startup.
+#
+# Skip anything currently being written: with the sensor already running this
+# would otherwise hand a half-written capture to the pipeline.
+orphans=0
+for f in "$STAGING"/*.pcap; do
+  [ -f "$f" ] || continue
+  # older than one rotation interval => cannot be the live file
+  if [ -z "$(find "$f" -newermt "-${ROTATE_SECS} seconds" 2>/dev/null)" ]; then
+    size=$(wc -c < "$f" 2>/dev/null || echo 0)
+    if [ "$size" -gt 24 ]; then
+      mv "$f" "${UPLOAD}/$(basename "$f")" && orphans=$((orphans + 1))
+    else
+      rm -f "$f"
+    fi
+  fi
+done
+[ "$orphans" -gt 0 ] && log "recovered ${orphans} orphaned capture(s) from a previous stop"
+
 log "sensor starting: ${ROUTER_USER}@${ROUTER_HOST} iface=${IFACE} snaplen=${SNAPLEN} rotate=${ROTATE_SECS}s"
 log "BPF: ${FILTER}"
 

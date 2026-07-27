@@ -271,3 +271,13 @@ protocol logs stay an hour or more behind real time.
 Set `ROTATE_SECS` to at least 300. Fewer, larger captures give roughly 5x
 headroom and let a backlog actually clear. The cost is ingest latency of about
 one rotation, which is a good trade against never catching up.
+
+### Stopping the sensor strands the capture it was writing
+`tcpdump -z` only runs the rotate hook when tcpdump itself closes a file. Kill
+the container and whatever it was mid-write stays in `staging/` forever — no
+process will ever move it, and that traffic is silently lost. Every restart
+leaks one more.
+
+`capture.sh` now sweeps `staging/` on startup, moving anything older than one
+rotation interval into `upload/` (the age test is what keeps it from grabbing
+the live file when a sensor is already running).
