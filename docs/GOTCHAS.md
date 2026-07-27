@@ -308,3 +308,48 @@ leaks one more.
 `capture.sh` now sweeps `staging/` on startup, moving anything older than one
 rotation interval into `upload/` (the age test is what keeps it from grabbing
 the live file when a sensor is already running).
+
+---
+
+## Findings the monitoring itself produced
+
+### An app with no reconnect backoff becomes the loudest thing on the network
+Not a Malcolm bug — a class of problem this stack is unusually good at finding,
+worth writing down because the symptom is so far from the cause.
+
+A container was configured with a database hostname that deliberately does not
+resolve locally (the real database lives elsewhere; the local service is gated
+behind a compose profile). Its connection helper re-ran a full ten-attempt retry
+cycle on **every query** whenever the pool was down, and a periodic refresh loop
+kept calling it.
+
+Result: ~180 failed lookups per minute, ~2,500 NXDOMAIN in the sample window —
+the single largest source of DNS traffic on the LAN, drowning every other signal
+in the logs. Nothing was broken from the application's point of view; it logged
+a warning and carried on.
+
+**How to find it:** the NXDOMAIN leaderboard (`tools/investigate`, DNS health).
+Names that do not exist, asked thousands of times, are always a misconfiguration
+somewhere. Rank by count and the offender is the top row.
+
+**The fix is a cooldown, not a retry-count change.** Reducing attempts per cycle
+just reduces the burst; the flood comes from re-running the cycle per query. One
+cycle per minute took it to ~4 lookups/minute, a ~44x reduction, with no
+behavioural change when the database is reachable.
+
+Related: an unqualified single-label hostname (`postgres`) generates *two*
+lookups, because the resolver also tries it with the search domain appended
+(`postgres.lan`). Both come back NXDOMAIN, so the volume doubles.
+
+### Malcolm leaks its own service names on restart
+Container names (`arkime`, `opensearch`, `filebeat`, `valkey-cache`,
+`pcap-monitor`) and reverse lookups for the Docker bridge appear as NXDOMAIN on
+the LAN resolver. Measured per hour: `435, 88, 0, 0, 26, 99` — it tracks
+container restarts, not steady state, and is a startup race where one service
+queries a sibling before it is up.
+
+It is bounded (~100 queries per restart) and self-limiting. Do **not** try to
+suppress it by pinning `dns`/`dns_search` on the Malcolm services: inter-service
+discovery depends on Docker's embedded resolver, and overriding it to stop a
+hundred stray queries risks breaking the thing the queries are for. Filter it at
+the resolver instead, or accept it.
