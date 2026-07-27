@@ -382,3 +382,29 @@ suppress it by pinning `dns`/`dns_search` on the Malcolm services: inter-service
 discovery depends on Docker's embedded resolver, and overriding it to stop a
 hundred stray queries risks breaking the thing the queries are for. Filter it at
 the resolver instead, or accept it.
+
+### JVM heap sized against the machine, not the data
+`configure` sets OpenSearch's heap from total system RAM. That is the wrong
+input twice: it ignores how much memory is actually free, and it ignores how
+much data you have.
+
+Here it produced `-Xmx6g` — **7.6 GB resident for a 160 MB index**. Combined
+with Logstash and everything else, container memory totalled 19.3 GB in a 21 GB
+VM, leaving ~180 MB free and several GB swapped.
+
+Dropping to `-Xmx4g` freed 2.4 GB and took free memory from 182 MB to 2.3 GB,
+with no effect on query behaviour.
+
+Size against the index, not the machine — roughly 1 GB heap per 20-30 GB of
+index, floor of ~2g:
+
+```sh
+tools/osapi es GET '_cluster/stats?filter_path=indices.store.size_in_bytes,indices.docs.count'
+```
+
+**Do not free memory by disabling NetBox or Strelka**, tempting as it looks
+(~1.5 GB between them, and both were verifiably idle here — `ZEEK_EXTRACTOR_MODE
+=none` means Strelka has no input, and NetBox enriched 0 documents).
+`nginx-proxy` hard-depends on `netbox`, and nginx dies outright on a missing
+upstream (`host not found in upstream`), taking the whole UI with it. The heap
+is the safe lever.
