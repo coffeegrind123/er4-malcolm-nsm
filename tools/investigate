@@ -1,0 +1,123 @@
+#!/usr/bin/env python3
+"""Standard investigation sweep over the capture data.
+
+    tools/investigate [hours]      default 3
+
+Sections: corpus, LAN devices, destinations, periodicity, alerts, exposure.
+
+The periodicity section is the interesting one. Bucket coverage alone cannot
+distinguish a beacon from a single long-lived connection - both appear in
+every time bucket with near-zero variance. The discriminator is source-port
+cardinality: a beacon opens a NEW connection each time (many ephemeral source
+ports), a persistent flow reuses one. Without that check, every long-running
+TLS session and VPN tunnel is reported as a beacon.
+"""
+import json
+import subprocess
+import statistics as st
+import sys
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OSAPI = str(HERE / "osapi")
+INDEX = "arkime_sessions3-*"
+HOURS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
+
+
+def es(method: str, path: str, body: str = "") -> dict:
+    out = subprocess.run([OSAPI, "es", method, path, body] if body else [OSAPI, "es", method, path],
+                         capture_output=True, text=True, timeout=180).stdout
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        # The console proxy returns OpenSearch errors as a JSON *string*.
+        return {"_raw": out[:300]}
+
+
+def ppl(q: str) -> list:
+    d = es("POST", "_plugins/_ppl", json.dumps({"query": q}))
+    return d.get("datarows", [])
+
+
+def head(t: str) -> None:
+    print(f"\n\033[1m{t}\033[0m")
+
+
+def search(body: dict) -> dict:
+    return es("POST", f"{INDEX}/_search", json.dumps(body))
+
+
+since = f"now-{HOURS}h"
+
+head(f"Corpus (last {HOURS}h)")
+for c, ds in sorted(ppl(f"source={INDEX} | stats count() by `event.dataset` | sort - `count()`"),
+                    key=lambda r: -r[0])[:20]:
+    print(f"  {c:>8d}  {ds}")
+
+head("LAN devices")
+# source.ip is mapped as type `ip`, so PPL's like() rejects it outright
+# ("LIKE function expects STRING, but got IP"). cidrmatch is the IP-typed
+# equivalent; without it this list silently fills up with external peers.
+lan = " or ".join(f"cidrmatch(`source.ip`, '{c}')"
+                  for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
+for row in ppl(f"source={INDEX} | where {lan} | stats count() by `source.ip` "
+               f"| sort - `count()` | head 15"):
+    print(f"  {row[0]:>8d}  {row[1]}")
+
+head("Top TLS destinations (SNI)")
+for row in ppl(f"source={INDEX} | where `event.dataset`='ssl' | stats count() by `server.domain` "
+               f"| sort - `count()` | head 20"):
+    if row[1] and row[1] != "-":
+        print(f"  {row[0]:>6d}  {row[1]}")
+
+head(f"Periodicity — beacons vs long-lived flows (last {HOURS}h)")
+agg = search({
+    "size": 0,
+    "query": {"bool": {"filter": [{"term": {"event.dataset": "conn"}},
+                                  {"range": {"@timestamp": {"gte": since}}}]}},
+    "aggs": {"dst": {"terms": {"field": "destination.ip", "size": 60},
+                     "aggs": {"tl": {"date_histogram": {"field": "@timestamp",
+                                                        "fixed_interval": "5m",
+                                                        "min_doc_count": 0}},
+                              "sports": {"cardinality": {"field": "source.port"}},
+                              "port": {"terms": {"field": "destination.port", "size": 1}}}}}
+})
+rows = []
+for b in agg.get("aggregations", {}).get("dst", {}).get("buckets", []):
+    counts = [x["doc_count"] for x in b["tl"]["buckets"]]
+    nz = [c for c in counts if c]
+    if len(counts) < 6 or sum(counts) < 12 or not nz:
+        continue
+    coverage = len(nz) / len(counts)
+    cv = st.pstdev(nz) / st.mean(nz) if len(nz) > 1 and st.mean(nz) else 9.0
+    sports = b["sports"]["value"]
+    pb = b["port"]["buckets"]
+    rows.append((coverage, cv, sports, sum(counts), b["key"], pb[0]["key"] if pb else "?"))
+
+rows.sort(key=lambda r: (-r[0], r[1]))
+print(f"  {'cover':>6} {'cv':>5} {'sports':>6} {'hits':>6}  destination:port")
+for cov, cv, sp, tot, ip, port in rows[:18]:
+    if cov > 0.9 and cv < 0.6:
+        verdict = "BEACON  (new conn each time)" if sp >= 8 else "long-lived flow (1 socket)"
+    else:
+        verdict = ""
+    print(f"  {cov*100:5.0f}% {cv:5.2f} {sp:6d} {tot:6d}  {ip}:{port}  {verdict}")
+
+head("Suricata alerts")
+for row in ppl(f"source={INDEX} | where `event.dataset`='alert' | stats count() by `rule.name` "
+               f"| sort - `count()` | head 12"):
+    if row[1] and row[1] != "-":
+        print(f"  {row[0]:>6d}  {str(row[1])[:80]}")
+
+head("Exposure — inbound to the LAN")
+for row in ppl(f"source={INDEX} | where `network.direction`='inbound' "
+               f"| stats count() by `destination.port`, `destination.ip` | sort - `count()` | head 12"):
+    print(f"  {row[0]:>6d}  -> {row[2]}:{row[1]}")
+
+head("Plaintext HTTP (payload visible on the wire)")
+for row in ppl(f"source={INDEX} | where `event.dataset`='http' | stats count() by `zeek.http.host` "
+               f"| sort - `count()` | head 12"):
+    if row[1] and row[1] != "-":
+        print(f"  {row[0]:>6d}  {row[1]}")
+
+print()

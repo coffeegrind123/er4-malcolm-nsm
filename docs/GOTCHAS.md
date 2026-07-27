@@ -151,6 +151,36 @@ with no error even though documents plainly carry the field. Use
 Absolute timestamps can be offset. Before reading "0 results" as "this did not
 happen", re-run without the filter to confirm the window contains data at all.
 
+### PPL `like()` refuses IP-typed fields
+`source.ip` and `destination.ip` are mapped as OpenSearch type `ip`, not string,
+so `like(\`source.ip\`, "192.168.1.%")` fails with *"LIKE function expects
+{[STRING,STRING,BOOLEAN]}, but got [IP,STRING,BOOLEAN]"*. Use `cidrmatch`:
+
+```sql
+source=arkime_sessions3-* | where cidrmatch(`source.ip`, '192.168.0.0/16')
+```
+
+Skip it and a "LAN devices" listing quietly fills with external peers instead of
+erroring.
+
+### PPL: dotted field names need backticks, and `span()` only goes in `by`
+`stats count() by source.ip` parses but misbehaves — quote as
+`` `source.ip` ``. The same applies to aggregate aliases when sorting:
+``sort - `count()` ``. And `span()` is a grouping expression, so
+`dc(span(@timestamp, 5m))` is a syntax error; it belongs in the `by` clause.
+
+### A long-lived connection is indistinguishable from a perfect beacon
+Bucket-coverage periodicity analysis — "contacted in every 5-minute bucket with
+near-zero variance" — flags a single persistent TLS session or VPN tunnel
+exactly as strongly as it flags real C2 beaconing. Both score ~100% coverage
+and a very low coefficient of variation.
+
+The discriminator is **source-port cardinality**. A beacon opens a new
+connection per check-in, so it burns many ephemeral source ports; a persistent
+flow reuses one socket. Aggregate `cardinality` on `source.port` alongside the
+date histogram — `tools/investigate` does this, and without it every Tailscale
+tunnel and long-poll connection reads as malicious.
+
 ### The bundled GeoIP database is stale
 GeoLite2 still maps some reallocated ranges to their previous holders — e.g.
 Hetzner's `91.98.0.0/16` and `46.225.32.0/20` resolve to Iranian ISPs, which

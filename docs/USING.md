@@ -220,6 +220,36 @@ tools/mapi "/mapi/agg/server.domain?filter=%7B%22source.ip%22%3A%22192.168.1.100
 
 ---
 
+## Standard sweep
+
+`tools/investigate [hours]` runs the whole routine in one pass: corpus by
+dataset, LAN devices, top TLS destinations, periodicity analysis, Suricata
+alerts, inbound exposure, and plaintext HTTP.
+
+```sh
+tools/investigate 3
+```
+
+The periodicity section separates **beacons** (new connection per check-in, many
+ephemeral source ports) from **long-lived flows** (one socket held open). Both
+look identical on time-bucket coverage alone, which is why raw "contacted every
+interval" heuristics flag every VPN tunnel as C2.
+
+Traffic worth recognising before calling anything suspicious:
+
+| Pattern | Almost always |
+|---|---|
+| `:41641` UDP, incl. to off-LAN gateways like `192.168.0.1` | Tailscale endpoint discovery |
+| `:3478` | STUN / NAT traversal |
+| `:5351` UDP to the router, high rate | NAT-PMP/PCP port mapping (Tailscale, torrent clients, consoles) |
+| `:1900` to the router | SSDP/UPnP discovery |
+| `:5355` to `224.0.0.252` / `ff02::1:3` | LLMNR — a *failing* name lookup, repeated |
+| `:10001` broadcast | Ubiquiti device discovery |
+
+A sustained LLMNR flood is worth chasing: it means something is repeatedly
+resolving a name that does not exist, usually a container or app pointed at a
+hostname that is not reachable from where it runs.
+
 ## Two habits worth keeping
 
 **Always run a control.** "No results" and "no data in that window" look
