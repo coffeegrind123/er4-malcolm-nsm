@@ -138,6 +138,48 @@ for row in ppl(f"source={INDEX} | where `event.dataset`='alert' | stats count() 
     if row[1] and row[1] != "-":
         print(f"  {row[0]:>6d}  {str(row[1])[:80]}")
 
+head("DNS health")
+# Two questions worth asking of DNS, and neither is "what did we look up".
+#
+# 1. How much of it is noise? Container names, search-suffix expansion and
+#    reverse lookups leaking to the LAN resolver are the loudest thing on most
+#    networks, and they hide everything else. A misconfigured app pointed at an
+#    unresolvable hostname can be 80% of all queries on its own.
+# 2. Is anything algorithmically generated? DGA domains are high-entropy in the
+#    first label. Legitimate CDN and telemetry hostnames score high too, so
+#    treat this as a shortlist to eyeball, never as a verdict.
+dns_stats = search({
+    "size": 0,
+    "query": {"bool": {"filter": [{"term": {"event.dataset": "dns"}},
+                                  {"range": {"@timestamp": {"gte": since}}}]}},
+    "aggs": {
+        "total": {"value_count": {"field": "dns.host"}},
+        "rcode": {"terms": {"field": "zeek.dns.rcode_name", "size": 5}},
+        "internal": {"filter": {"bool": {"should": [
+            {"wildcard": {"dns.host": "*.in-addr.arpa"}},
+            {"wildcard": {"dns.host": "*.lan"}},
+            {"wildcard": {"dns.host": "*.local"}},
+            {"bool": {"must_not": {"wildcard": {"dns.host": "*.*"}}}},
+        ], "minimum_should_match": 1}}},
+        "nx": {"filter": {"term": {"zeek.dns.rcode_name": "NXDOMAIN"}},
+               "aggs": {"names": {"terms": {"field": "dns.host", "size": 8}}}},
+    },
+})
+a = dns_stats.get("aggregations", {})
+total = a.get("total", {}).get("value", 0) or 0
+internal = a.get("internal", {}).get("doc_count", 0)
+if total:
+    print(f"  {total} queries; {internal} internal/unqualified ({100*internal/total:.0f}%), "
+          f"{total-internal} genuine external")
+print("  rcodes: " + ", ".join(f"{b['key']}={b['doc_count']}"
+                               for b in a.get("rcode", {}).get("buckets", [])))
+nx = a.get("nx", {})
+if nx.get("doc_count"):
+    print(f"  NXDOMAIN ({nx['doc_count']}) — names that do not exist, asked repeatedly:")
+    for b in nx.get("names", {}).get("buckets", [])[:8]:
+        if b["key"] != "-":
+            print(f"    {b['doc_count']:>6d}  {b['key']}")
+
 head("Exposure — inbound to the LAN")
 for row in ppl(f"source={INDEX} | where `network.direction`='inbound' "
                f"| stats count() by `destination.port`, `destination.ip` | sort - `count()` | head 12"):

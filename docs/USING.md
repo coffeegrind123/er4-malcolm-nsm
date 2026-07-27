@@ -297,3 +297,31 @@ A destination with **no SNI and no DNS lookup** is worth a second look, but it i
 not automatically suspicious — VPN mesh clients connect to relay IPs from a
 baked-in list and never resolve a name, which reproduces that signature exactly.
 Check RDAP before drawing conclusions.
+
+## Reading DNS health
+
+`tools/investigate` reports the split between internal and genuinely external
+lookups, plus the NXDOMAIN leaderboard.
+
+Expect the internal share to be **large** — often 80-95%. Container names,
+search-suffix expansion (`name`, `name.lan`, `name.local`), and reverse lookups
+for RFC1918 space all escape to the LAN resolver, and one misconfigured
+application can account for most of it on its own. A container pointed at a
+database hostname it cannot resolve retried every 3 seconds and produced ~2,500
+NXDOMAIN queries; on a quiet network that alone was a quarter of all traffic.
+
+The NXDOMAIN list is the fastest way to find that class of problem: **names that
+do not exist, asked repeatedly, are always a misconfiguration.** Worth acting on
+even when harmless, because the volume buries everything else.
+
+Two things that will show up there and are not misconfigurations:
+
+- `wpad.lan` / `wpad.<domain>` — Windows proxy auto-discovery. Harmless here, but
+  WPAD is a known hijack vector and is worth disabling in the OS.
+- Your own monitoring stack's service names, if it runs on the same host — a
+  container that briefly cannot resolve a sibling forwards the query upstream.
+
+**High entropy is a shortlist, not a verdict.** DGA domains score high in the
+first label, but so do CDN and telemetry hostnames — `ohttp-relay-safebrowsing-
+chrome.google.fastly-edge.com` tops the list on a perfectly clean network.
+Eyeball the names; do not alert on the score.
