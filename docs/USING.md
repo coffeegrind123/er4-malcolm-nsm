@@ -259,3 +259,16 @@ and confirm the window contains anything at all. The `from`/`to` parsing on
 
 **Verify enrichment against an authoritative source** before acting on it.
 GeoIP and ASN attribution are the usual culprits — see above.
+
+## Keeping it running
+
+```sh
+tools/watchdog          # one line per problem, silent when healthy
+tools/watchdog --heal   # also restart pcap-monitor if the publisher stalled
+```
+
+Worth running on a timer. The failure it exists for — the pcap publisher going
+silent while its process, its container and every other container all report
+healthy — is invisible to `docker compose ps`, and costs you every packet
+captured until someone notices the graphs are flat. See
+[GOTCHAS.md](GOTCHAS.md).

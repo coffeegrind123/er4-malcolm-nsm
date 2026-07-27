@@ -1,0 +1,70 @@
+#!/usr/bin/env bash
+# Health check for the capture pipeline. Prints one line per problem and exits
+# non-zero if any were found; silent and exit 0 when healthy.
+#
+#   tools/watchdog          check only
+#   tools/watchdog --heal   also restart pcap-monitor if the publisher stalled
+#
+# The interesting check is the publisher one. Malcolm's pcap-monitor runs two
+# independent processes:
+#
+#   watch-upload     moves pcap/upload -> pcap/processed
+#   pcap-publisher   watches pcap/processed and notifies Zeek/Suricata/Arkime
+#
+# The publisher can stop emitting while its process stays alive, logs no error,
+# and the container keeps reporting healthy. The mover carries on, so captures
+# still flow across the disk and nothing looks wrong - but nothing is analysed
+# and every new packet is silently discarded from the index. Comparing the
+# newest processed capture against the last publish is what catches it.
+#
+# Do NOT alert on a flat document count alone: an idle network legitimately
+# produces no new documents, and a date-pinned index name stops growing at every
+# UTC midnight rollover even though ingestion is perfectly healthy.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OSAPI="${HERE}/osapi"
+
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+MONITOR_CONTAINER="${MONITOR_CONTAINER:-malcolm-pcap-monitor-1}"
+SENSOR_CONTAINER="${SENSOR_CONTAINER:-er4-sensor}"
+STALL_SECS="${STALL_SECS:-420}"
+HEAL=0; [[ "${1:-}" == "--heal" ]] && HEAL=1
+
+problems=0
+report() { echo "$*"; problems=$((problems + 1)); }
+
+health=$("$OSAPI" es GET _cluster/health 2>/dev/null \
+  | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','UNREACHABLE'))" 2>/dev/null) \
+  || health=UNREACHABLE
+[[ "$health" == "green" ]] || report "CLUSTER ${health:-UNREACHABLE}"
+
+docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SENSOR_CONTAINER" \
+  || report "SENSOR DOWN (${SENSOR_CONTAINER} not running)"
+
+unhealthy=$(cd "$MALCOLM_DIR" && docker compose ps --format '{{.Name}} {{.Status}}' 2>/dev/null \
+            | grep -viE 'healthy|Up [0-9]+ (second|minute)s? \(health: starting\)' | head -3)
+[[ -n "$unhealthy" ]] && report "UNHEALTHY: $(echo "$unhealthy" | tr '\n' ';')"
+
+# Newest capture that reached processed/, as epoch seconds.
+newest=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c \
+  'ls -t /p/processed/*.pcap 2>/dev/null | head -1 | xargs -r stat -c %Y' 2>/dev/null)
+
+# When the publisher last announced a file to the analysers.
+last_pub=$(docker logs --since 30m "$MONITOR_CONTAINER" 2>&1 | grep -F '📫' | tail -1 \
+           | grep -oE '^[0-9]{4}-[0-9]{2}-[0-9]{2} [0-9]{2}:[0-9]{2}:[0-9]{2}')
+last_pub_epoch=$([[ -n "$last_pub" ]] && date -u -d "$last_pub" +%s 2>/dev/null || echo 0)
+
+if [[ -n "${newest:-}" && "${newest:-0}" -gt 0 ]]; then
+  lag=$(( newest - last_pub_epoch ))
+  if [[ "$last_pub_epoch" -eq 0 || "$lag" -gt "$STALL_SECS" ]]; then
+    report "PUBLISHER STALLED (captures arriving, last publish ${lag}s older than newest capture)"
+    if [[ "$HEAL" -eq 1 ]]; then
+      echo "  healing: restarting ${MONITOR_CONTAINER}"
+      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart pcap-monitor >/dev/null 2>&1) \
+        && echo "  restarted - re-queue any unanalysed captures from processed/ into upload/"
+    fi
+  fi
+fi
+
+exit $(( problems > 0 ))

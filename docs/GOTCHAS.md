@@ -119,6 +119,44 @@ and Arkime over ZMQ. Looking only at `upload` misleads. ZMQ pub/sub is lossy —
 a subscriber restarting misses whatever was published meanwhile, so those files
 are simply never analysed.
 
+### The pcap publisher can stop while everything still looks healthy
+Observed in production. `pcap-monitor` runs two independent processes:
+`watch-upload` (moves `pcap/upload` → `pcap/processed`) and `pcap-publisher`
+(watches `processed` and notifies Zeek/Suricata/Arkime over ZMQ).
+
+The publisher stopped emitting and never recovered. Everything that normally
+indicates a problem said otherwise:
+
+- the process was **alive** (`supervisorctl status` RUNNING, uptime unbroken)
+- **no exception, no traceback**, nothing in its log at all
+- the container stayed **healthy**, and so did all 22 others
+- the mover kept working, so captures kept flowing across the disk
+- `docker logs` looked busy — every line was the *other* process
+
+The only visible symptom was the OpenSearch document count going flat while
+capture files kept arriving. Fifteen minutes of traffic was moved to
+`processed/` and never analysed.
+
+Diagnosis that worked: the publisher had **0 open sockets** — not blocked on
+OpenSearch, simply not doing anything. Restarting `pcap-monitor` resumed it.
+
+`tools/watchdog` checks for this by comparing the newest capture in
+`processed/` against the last publish timestamp. In healthy operation the
+publish is *newer* than the file (lag is negative); during the stall the newest
+file ran 900s ahead of the last publish. `--heal` restarts the container.
+
+**Captures during the stall are recoverable** — they are sitting in
+`processed/`, just never analysed. Copy them back into `upload/` to re-queue
+them. Only re-queue files the publisher never announced, or you will duplicate
+sessions; the last `📫` line in its log tells you where it stopped.
+
+### Do not alert on a flat document count
+Two ways that false-positives: an idle network legitimately indexes nothing, and
+a **date-pinned index name** (`arkime_sessions3-260727`) stops growing at every
+UTC midnight rollover while ingestion is perfectly healthy. Query the wildcard
+`arkime_sessions3-*`, and alert on "captures arriving but nothing published"
+rather than on the count alone.
+
 ### Zeek writes tarballs, filebeat unpacks them
 Zeek emits `.tar.gz` into `zeek-logs/upload`;
 `filebeat-watch-zeeklogs-uploads-folder.py` extracts them.
