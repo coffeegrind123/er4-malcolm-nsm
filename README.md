@@ -120,6 +120,12 @@ setup steps that script would otherwise have done (see
 
 ## Using it
 
+**[docs/API.md](docs/API.md)** — everything in Dashboards Management, Data
+Administration and Settings & Setup driven from the CLI via `tools/osapi`:
+index patterns, saved objects, advanced settings, workspaces, ISM retention,
+SQL/PPL, query insights, and the security admin API (which needs a client
+certificate, not a password). Nothing is read-only.
+
 **[docs/USING.md](docs/USING.md)** — how to actually interrogate the data:
 Dev Tools Console queries, the single unified index everything lands in, which
 of the 111 dashboards have data on a typical network, Arkime drill-down and PCAP

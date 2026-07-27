@@ -1,0 +1,30 @@
+{
+  "policy": {
+    "description": "Age out captured session indices. Full-packet capture indices grow fast; without this they grow until the disk does not.",
+    "default_state": "hot",
+    "states": [
+      {
+        "name": "hot",
+        "actions": [],
+        "transitions": [
+          { "state_name": "warm", "conditions": { "min_index_age": "7d" } }
+        ]
+      },
+      {
+        "name": "warm",
+        "actions": [
+          { "read_only": {} },
+          { "force_merge": { "max_num_segments": 1 } }
+        ],
+        "transitions": [
+          { "state_name": "delete", "conditions": { "min_index_age": "90d" } }
+        ]
+      },
+      {
+        "name": "delete",
+        "actions": [ { "delete": {} } ],
+        "transitions": []
+      }
+    ]
+  }
+}

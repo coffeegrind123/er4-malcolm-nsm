@@ -1,0 +1,108 @@
+#!/usr/bin/env bash
+# One entry point for every management surface in the stack.
+#
+#   osapi es GET  _cluster/health
+#   osapi es POST 'arkime_sessions3-*/_search' '{"size":0,"aggs":{"d":{"terms":{"field":"event.dataset"}}}}'
+#   osapi osd /api/saved_objects/_find?type=dashboard&per_page=100
+#   osapi settings get
+#   osapi settings set timepicker:timeDefaults '{"from":"now-24h","to":"now"}'
+#   osapi ws list
+#   osapi ws create "Network Investigation" analytics
+#   osapi sec GET _plugins/_security/api/internalusers
+#   osapi ism list
+#
+# Three transports, because the surfaces genuinely differ:
+#
+#   osd   -> nginx -> OpenSearch Dashboards REST (saved objects, settings, workspaces)
+#   es    -> the Dev Tools console proxy, which reaches the whole OpenSearch REST API
+#            (ISM, aliases, templates, snapshots, notifications, ML, _cat, search)
+#   sec   -> the security plugin admin API. This one is NOT reachable through nginx:
+#            it requires the admin *certificate*, not a password, so the call is
+#            executed inside the opensearch container where that cert lives.
+set -euo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+
+BASE="${MALCOLM_BASE:-https://host.docker.internal}"
+USER_="${MALCOLM_USER:-admin}"
+PASS="$(cat "${MALCOLM_PW_FILE:-${HERE}/../keys/malcolm_pw}")"
+OS_CONTAINER="${OS_CONTAINER:-malcolm-opensearch-1}"
+CERTS=/usr/share/opensearch/config/certs
+
+urlenc() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
+
+# Dashboards REST. osd-xsrf is mandatory on anything that is not a GET.
+osd() {
+  local path="$1"; shift
+  curl -sk -u "${USER_}:${PASS}" -H 'osd-xsrf: true' -H 'Content-Type: application/json' \
+       "${BASE}/dashboards${path}" "$@"
+}
+
+# OpenSearch REST through the console proxy. The proxy is always POSTed to; the
+# *target* method travels in the query string.
+es() {
+  local method="${1:-GET}" path="${2:-_cluster/health}" body="${3:-}"
+  local url="${BASE}/dashboards/api/console/proxy?path=$(urlenc "$path")&method=${method}"
+  if [[ -n "$body" ]]; then
+    curl -sk -u "${USER_}:${PASS}" -X POST -H 'osd-xsrf: true' -H 'Content-Type: application/json' -d "$body" "$url"
+  else
+    curl -sk -u "${USER_}:${PASS}" -X POST -H 'osd-xsrf: true' "$url"
+  fi
+}
+
+# Security admin. Runs inside the container because the admin cert is the only
+# credential the security plugin's admin API accepts. -k is required: the server
+# certificate's CN is opensearch-node, so verifying against "localhost" fails -
+# client-certificate auth is unaffected by it.
+sec() {
+  local method="${1:-GET}" path="${2:-_plugins/_security/api/internalusers}" body="${3:-}"
+  local args=(-sk --cert "${CERTS}/admin.crt" --key "${CERTS}/admin.key" -X "$method"
+              -H 'Content-Type: application/json' "https://localhost:9200/${path}")
+  [[ -n "$body" ]] && args+=(-d "$body")
+  docker exec -i "$OS_CONTAINER" curl "${args[@]}"
+}
+
+case "${1:-help}" in
+  osd)  shift; osd "$@" ;;
+  es)   shift; es "$@" ;;
+  sec)  shift; sec "$@" ;;
+
+  settings)
+    case "${2:-get}" in
+      get) osd /api/opensearch-dashboards/settings ;;
+      set) osd /api/opensearch-dashboards/settings -X POST \
+             -d "{\"changes\":{\"$3\":$( [[ "$4" == \{* || "$4" == \[* || "$4" =~ ^-?[0-9.]+$ || "$4" == true || "$4" == false ]] && echo "$4" || echo "\"$4\"" )}}" ;;
+      *)   echo "usage: osapi settings get|set <key> <value>" >&2; exit 1 ;;
+    esac ;;
+
+  ws)
+    case "${2:-list}" in
+      list)   osd /api/workspaces/_list -X POST -d '{}' ;;
+      create) osd /api/workspaces -X POST \
+                -d "{\"attributes\":{\"name\":\"$3\",\"features\":[\"use-case-${4:-analytics}\"]}}" ;;
+      delete) osd "/api/workspaces/$3" -X DELETE ;;
+      *) echo "usage: osapi ws list|create <name> [use-case]|delete <id>" >&2; exit 1 ;;
+    esac ;;
+
+  ism)
+    case "${2:-list}" in
+      list)   es GET  _plugins/_ism/policies ;;
+      add)    es PUT  "_plugins/_ism/policies/$3" "$(cat "$4")" ;;
+      apply)  es POST "_plugins/_ism/add/$3" "{\"policy_id\":\"$4\"}" ;;
+      status) es GET  "_plugins/_ism/explain/$3" ;;
+      *) echo "usage: osapi ism list|add <id> <file>|apply <index> <policy>|status <index>" >&2; exit 1 ;;
+    esac ;;
+
+  # Usually the fastest way to ask a question. PPL in particular beats hand-
+  # writing aggregation DSL:
+  #   osapi ppl 'source=arkime_sessions3-* | stats count() by event.dataset'
+  sql) shift; es POST _plugins/_sql "$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1]}))' "$1")" ;;
+  ppl) shift; es POST _plugins/_ppl "$(python3 -c 'import json,sys;print(json.dumps({"query":sys.argv[1]}))' "$1")" ;;
+
+  insights) es GET "_insights/top_queries?type=${2:-latency}" ;;
+
+  objects) osd "/api/saved_objects/_find?type=${2:-dashboard}&per_page=${3:-100}&fields=title" ;;
+
+  help|*)
+    sed -n '2,30p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//'
+    ;;
+esac
