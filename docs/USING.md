@@ -272,3 +272,28 @@ silent while its process, its container and every other container all report
 healthy — is invisible to `docker compose ps`, and costs you every packet
 captured until someone notices the graphs are flat. See
 [GOTCHAS.md](GOTCHAS.md).
+
+## Reading the upload leaderboard
+
+`tools/investigate` ranks destinations by bytes **sent from** your network.
+Asymmetry is the interesting axis: normal browsing is download-heavy, so a
+destination that receives far more than it sends is a backup, a sync client,
+telemetry — or something you did not install on purpose.
+
+Two traps when interpreting it:
+
+- **Use `client.bytes` / `server.bytes`, not `source.bytes` / `destination.bytes`.**
+  The client/server pair is relative to who *initiated* the connection, which is
+  what "uploaded" means. Source/destination is per-packet direction and will
+  mislead you on long-lived flows.
+- **`conn` records carry no SNI.** The hostname lives in the `ssl` dataset, so a
+  volume aggregation shows `-` for every destination. Resolve separately:
+  ```sh
+  tools/osapi ppl "source=arkime_sessions3-* | where \`destination.ip\`='IP' \
+    and \`event.dataset\`='ssl' | stats count() by \`server.domain\`"
+  ```
+
+A destination with **no SNI and no DNS lookup** is worth a second look, but it is
+not automatically suspicious — VPN mesh clients connect to relay IPs from a
+baked-in list and never resolve a name, which reproduces that signature exactly.
+Check RDAP before drawing conclusions.

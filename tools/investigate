@@ -103,6 +103,35 @@ for cov, cv, sp, tot, ip, port in rows[:18]:
         verdict = ""
     print(f"  {cov*100:5.0f}% {cv:5.2f} {sp:6d} {tot:6d}  {ip}:{port}  {verdict}")
 
+head(f"Upload volume — what is leaving the network (last {HOURS}h)")
+# Asymmetry, not raw volume, is the interesting axis. Normal browsing is
+# download-heavy; a destination that receives far more than it sends is a
+# backup, a sync client, or telemetry - and occasionally something you did not
+# install on purpose.
+#
+# Use client.bytes / server.bytes rather than source.bytes / destination.bytes:
+# the former are relative to who initiated the connection, which is what
+# "uploaded" actually means here.
+vol = search({
+    "size": 0,
+    "query": {"bool": {"filter": [{"term": {"event.dataset": "conn"}},
+                                  {"range": {"@timestamp": {"gte": since}}}]}},
+    "aggs": {"dst": {"terms": {"field": "destination.ip", "size": 300, "order": {"up": "desc"}},
+                     "aggs": {"up": {"sum": {"field": "client.bytes"}},
+                              "down": {"sum": {"field": "server.bytes"}}}}}
+})
+print(f"  {'UP(MB)':>8} {'DOWN(MB)':>9} {'ratio':>7}  destination")
+for b in vol.get("aggregations", {}).get("dst", {}).get("buckets", [])[:14]:
+    up = b["up"]["value"] or 0
+    down = b["down"]["value"] or 0
+    if up < 100_000:
+        continue
+    ratio = up / down if down else float("inf")
+    note = "  <-- upload-heavy" if ratio > 2 else ""
+    print(f"  {up/1048576:8.1f} {down/1048576:9.1f} {ratio:7.1f}  {b['key']}{note}")
+print("  (resolve names with: tools/osapi ppl \"source=arkime_sessions3-* | where "
+      "`destination.ip`='IP' and `event.dataset`='ssl' | stats count() by `server.domain`\")")
+
 head("Suricata alerts")
 for row in ppl(f"source={INDEX} | where `event.dataset`='alert' | stats count() by `rule.name` "
                f"| sort - `count()` | head 12"):
