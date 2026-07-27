@@ -46,6 +46,20 @@ A worked example needs a real-looking address, not a real one. Third-party
 public infrastructure used to illustrate a checkable fact (a registry lookup
 that anyone can reproduce) is fine; it says nothing about the monitored network.
 
+## Scrub the commit, not the working tree
+
+A search-and-replace over the whole directory will also rewrite `config.env` —
+which is gitignored, so it was never the problem, but *is* what the running
+deployment reads. Replacing real addresses there points the live system at
+placeholder hosts and paths. That is how capture gets stopped by a
+documentation change.
+
+Restrict any sanitisation pass to tracked files, and exclude local config:
+
+```sh
+git ls-files | grep -vE '^(config\.env|keys/)' | xargs sed -i 's/REAL/PLACEHOLDER/g'
+```
+
 ## Check before every push
 
 ```sh

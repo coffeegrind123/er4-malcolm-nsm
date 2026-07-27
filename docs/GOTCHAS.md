@@ -257,3 +257,17 @@ acting on any country or ASN attribution:
 ```sh
 curl -s https://rdap.db.ripe.net/ip/91.98.9.143 | jq '{handle,name,country}'
 ```
+
+### Rotation interval must clear the downstream poll cadence
+The spool watchers process roughly **one file per poll cycle**, and the cycle is
+about 60 seconds. Measured extract gaps were 62s, 63s, 58s, 62s — with
+occasional 2s bursts, so it is cadence-limited, not I/O-limited.
+
+A 60-second capture rotation therefore produces files at exactly the rate the
+consumer can drain them. Production and consumption sit at break-even, so any
+backlog — after a stall, or a burst of traffic — becomes **permanent**, and
+protocol logs stay an hour or more behind real time.
+
+Set `ROTATE_SECS` to at least 300. Fewer, larger captures give roughly 5x
+headroom and let a backlog actually clear. The cost is ingest latency of about
+one rotation, which is a good trade against never catching up.
