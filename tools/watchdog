@@ -3,7 +3,8 @@
 # non-zero if any were found; silent and exit 0 when healthy.
 #
 #   tools/watchdog          check only
-#   tools/watchdog --heal   also restart pcap-monitor if the publisher stalled
+#   tools/watchdog --heal   also repair what it finds: restart a stalled
+#                           publisher, or re-queue a stranded queue head
 #
 # The interesting check is the publisher one. Malcolm's pcap-monitor runs two
 # independent processes:
@@ -30,6 +31,9 @@ ZEEK_MOUNT="${ZEEK_MOUNT:-//d/malcolm-data/zeek-logs}"
 MONITOR_CONTAINER="${MONITOR_CONTAINER:-malcolm-pcap-monitor-1}"
 SENSOR_CONTAINER="${SENSOR_CONTAINER:-er4-sensor}"
 STALL_SECS="${STALL_SECS:-420}"
+# Where the head-of-queue tracking state lives (needed to spot a stranded head).
+STATE_DIR="${STATE_DIR:-${TMPDIR:-/tmp}/er4-watchdog}"
+mkdir -p "$STATE_DIR"
 HEAL=0; [[ "${1:-}" == "--heal" ]] && HEAL=1
 
 problems=0
@@ -106,8 +110,37 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
   # backlogged. Only restart when nothing is draining.
   local drained
   drained=$(docker logs --since 5m "$(drain_container "$svc")" 2>&1 | grep -cE '🖅|📫' || true)
+
+  # ...but "draining" is not the same as "making progress". The watchers only
+  # act on *created* events, so anything already present when one starts is
+  # skipped forever while new arrivals sail past it. The queue then looks busy
+  # and healthy - events flowing, count roughly stable - with a permanently
+  # stranded head. 68 tarballs sat like that for four hours.
+  #
+  # The tell is the OLDEST entry never changing. Track it across runs.
+  local state="${STATE_DIR}/$(echo "$label" | tr '/' '_').oldest"
+  local prev=""; [[ -f "$state" ]] && prev=$(cat "$state")
+  echo "$oldest" > "$state"
+
+  if [[ -n "$prev" && "$prev" == "$oldest" && "$count" -gt 0 ]]; then
+    report "QUEUE HEAD STUCK: ${label} (${count} pending, head unchanged at ${oldest}, ${age}s old)"
+    # A restart does NOT fix this - the files are still pre-existing to the
+    # restarted watcher. Re-present them as new instead.
+    if [[ "$HEAL" -eq 1 ]]; then
+      echo "  healing: re-queuing stranded entries in ${label}"
+      docker run --rm -v "${mount}:/q" alpine sh -c \
+        "mkdir -p /q/.requeue
+         for f in /q/${dir}; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/.requeue/ 2>/dev/null; done
+         sleep 20
+         for f in /q/.requeue/*; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/$(dirname "$dir")/ 2>/dev/null; done
+         rmdir /q/.requeue 2>/dev/null; true" >/dev/null 2>&1
+      echo "  re-queued - watchers see them as new files now"
+    fi
+    return 0
+  fi
+
   if [[ "${drained:-0}" -gt 0 ]]; then
-    report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; draining - ${drained} events/5m, not restarting)"
+    report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; draining - ${drained} events/5m, head advancing)"
     return 0
   fi
 

@@ -258,19 +258,46 @@ acting on any country or ASN attribution:
 curl -s https://rdap.db.ripe.net/ip/91.98.9.143 | jq '{handle,name,country}'
 ```
 
-### Rotation interval must clear the downstream poll cadence
-The spool watchers process roughly **one file per poll cycle**, and the cycle is
-about 60 seconds. Measured extract gaps were 62s, 63s, 58s, 62s — with
-occasional 2s bursts, so it is cadence-limited, not I/O-limited.
+### A queue can drain steadily and still never make progress
+This one cost two wrong diagnoses, so it is worth the detail.
 
-A 60-second capture rotation therefore produces files at exactly the rate the
-consumer can drain them. Production and consumption sit at break-even, so any
-backlog — after a stall, or a burst of traffic — becomes **permanent**, and
-protocol logs stay an hour or more behind real time.
+Symptom: 67 Zeek tarballs pending, unchanged across half an hour. Extract events
+were flowing the whole time (3–5 per 5 minutes) and the consumer looked healthy.
 
-Set `ROTATE_SECS` to at least 300. Fewer, larger captures give roughly 5x
-headroom and let a backlog actually clear. The cost is ingest latency of about
-one rotation, which is a good trade against never catching up.
+**Wrong diagnosis 1 — "the consumer is too slow."** Extract gaps measured 62s,
+63s, 58s, 62s, which reads as a ~60s poll cycle handling one file each. It is
+not: those gaps were just the rate at which *new* files arrived (a 60s capture
+rotation). The consumer's actual capacity, once measured properly, was **68
+files in under 100 seconds**. Rate-of-arrival is not rate-of-service, and you
+cannot tell them apart from a healthy system.
+
+**Wrong diagnosis 2 — "the backlog will converge."** Also wrong, because the
+queue was not FIFO in practice.
+
+**Actual cause:** the watchers act on *created* events only, so the 67 files that
+were already present when the watcher restarted were skipped **forever** while
+every new arrival sailed past them. Steady-state count, steady event flow,
+permanently stranded head.
+
+The diagnostic that settles it: **watch the oldest entry, not the count.** If
+the head never changes while the queue drains, entries are being passed over,
+not processed. `tools/watchdog` tracks this across runs and reports
+`QUEUE HEAD STUCK`.
+
+**Restarting does not fix it** — after a restart those files are still
+pre-existing. Re-present them as new by moving them out and back in:
+
+```sh
+mkdir -p /queue/.requeue
+mv /queue/dir/* /queue/.requeue/ && sleep 20 && mv /queue/.requeue/* /queue/dir/
+```
+
+Draining 68 stranded tarballs this way recovered a window that had held Suricata
+alerts only, restoring its Zeek `dns`, `conn` and `ssl` records.
+
+`ROTATE_SECS` is set to 300 rather than 60 — fewer, larger captures mean less
+per-file overhead — but note that is a tidiness choice, **not** the fix for a
+backlog. The fix is above.
 
 ### Stopping the sensor strands the capture it was writing
 `tcpdump -z` only runs the rotate hook when tcpdump itself closes a file. Kill
