@@ -105,12 +105,40 @@ last_pub_epoch=$([[ -n "$last_pub" ]] && date -u -d "$last_pub" +%s 2>/dev/null 
 if [[ -n "${newest:-}" && "${newest:-0}" -gt 0 ]]; then
   lag=$(( newest - last_pub_epoch ))
   if [[ "$last_pub_epoch" -eq 0 || "$lag" -gt "$STALL_SECS" ]]; then
-    report "PUBLISHER STALLED (captures arriving, last publish ${lag}s older than newest capture)"
-    if [[ "$HEAL" -eq 1 ]]; then
-      echo "  healing: restarting ${MONITOR_CONTAINER}"
-      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart pcap-monitor >/dev/null 2>&1) \
-        && echo "  restarted - re-queue any unanalysed captures from processed/ into upload/"
+
+    # This path had no rate limit, and the lag it measures cannot fall while a
+    # restart is in progress: `newest` keeps advancing with every new capture
+    # while the restarted publisher spends its first 60s in --start-sleep. So a
+    # publisher that is merely slower than the arrival rate got restarted on
+    # every run, and each restart threw away the progress it had made. That is
+    # the restart-loop failure this file already warns about, in the one branch
+    # that had no protection against it.
+    pstate="${STATE_DIR}/publisher.restarted"
+    plast=0; [[ -f "$pstate" ]] && plast=$(cat "$pstate" 2>/dev/null || echo 0)
+    psince=$(( $(date -u +%s) - plast ))
+
+    if [[ "$plast" -gt 0 && "$psince" -lt "${RESTART_GRACE_SECS:-120}" ]]; then
+      : # restarted moments ago and still warming up; not a finding yet
+    elif [[ "$plast" -gt 0 && "$psince" -lt "${RESTART_ESCALATE_SECS:-900}" ]]; then
+      # Already restarted once this incident and it did not take. Restarting
+      # again only resets the clock, so stop and escalate to a human instead.
+      report "PUBLISHER STILL STALLED ${psince}s after a restart (lag ${lag}s) - NOT restarting again"
+      echo "  a second restart cannot help: it re-enters --start-sleep and drops progress."
+      echo "  if this persists, re-present the unpublished captures to the watcher with:"
+      echo "    tools/watchdog --heal   # after the ${RESTART_ESCALATE_SECS:-900}s window, or investigate by hand"
+    else
+      report "PUBLISHER STALLED (captures arriving, last publish ${lag}s older than newest capture)"
+      if [[ "$HEAL" -eq 1 ]]; then
+        echo "  healing: restarting ${MONITOR_CONTAINER}"
+        if (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart pcap-monitor >/dev/null 2>&1); then
+          date -u +%s > "$pstate"
+          echo "  restarted - will not restart again for ${RESTART_ESCALATE_SECS:-900}s"
+        fi
+      fi
     fi
+  else
+    # Publishing again: this incident is over, so a future stall starts clean.
+    rm -f "${STATE_DIR}/publisher.restarted"
   fi
 fi
 
@@ -192,6 +220,20 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
     local last_restart=0
     [[ -f "$rstate" ]] && last_restart=$(cat "$rstate" 2>/dev/null || echo 0)
     local since_restart=$(( $(date -u +%s) - last_restart ))
+
+    # A restart needs time before "no events" means anything: pcap_watcher runs
+    # --start-sleep 60 and the mover --start-sleep 30, so a freshly restarted
+    # consumer is silent BY DESIGN. Without a floor here, a check landing shortly
+    # after a restart reads that designed silence as "the restart did not help"
+    # and escalates to a re-queue that was never needed. Seen for real at
+    # since_restart=5s, when two checks interleaved.
+    #
+    # So escalate only inside a window: old enough to have had a fair chance,
+    # recent enough that it is still the same incident.
+    if [[ "$last_restart" -gt 0 && "$since_restart" -lt "${RESTART_GRACE_SECS:-120}" ]]; then
+      # Still warming up. Not a problem yet, and emphatically not a re-queue.
+      return 0
+    fi
 
     if [[ "$last_restart" -gt 0 && "$since_restart" -lt "${RESTART_ESCALATE_SECS:-900}" ]]; then
       report "QUEUE STALLED: ${label} (${count} pending, ${age}s old; restart ${since_restart}s ago did not help - files are stranded, not the process)"
