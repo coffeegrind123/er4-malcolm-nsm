@@ -44,10 +44,47 @@ HEAL=0; [[ "${1:-}" == "--heal" ]] && HEAL=1
 problems=0
 report() { echo "$*"; problems=$((problems + 1)); }
 
-health=$("$OSAPI" es GET _cluster/health 2>/dev/null \
-  | python3 -c "import sys,json;print(json.load(sys.stdin).get('status','UNREACHABLE'))" 2>/dev/null) \
-  || health=UNREACHABLE
-[[ "$health" == "green" ]] || report "CLUSTER ${health:-UNREACHABLE}"
+# Cluster health, with transient recovery separated from actual degradation.
+#
+# "not green" is not the same as "broken". A shard being created or recovering
+# makes the cluster red for a few seconds - routine index rollover does it - and
+# alerting on that trains you to ignore the alert that matters. Observed: a red
+# alert fired for one initializing shard, 0 unassigned, and the cluster was green
+# again inside a minute.
+#
+# The discriminator is unassigned_shards. Unassigned means data is genuinely
+# unavailable right now: alert immediately. Initializing or relocating with none
+# unassigned is recovery in progress, so require it to still be non-green on the
+# NEXT run before saying anything - the same two-observation rule the stuck-head
+# check uses below.
+read -r health unassigned initializing < <("$OSAPI" es GET _cluster/health 2>/dev/null \
+  | python3 -c "
+import sys, json
+try:
+    d = json.load(sys.stdin)
+    print(d.get('status','UNREACHABLE'),
+          d.get('unassigned_shards',0),
+          d.get('initializing_shards',0) + d.get('relocating_shards',0))
+except Exception:
+    print('UNREACHABLE 0 0')
+" 2>/dev/null) || { health=UNREACHABLE; unassigned=0; initializing=0; }
+
+cstate="${STATE_DIR}/cluster.notgreen"
+if [[ "$health" == "green" ]]; then
+  rm -f "$cstate"
+elif [[ "$health" == "UNREACHABLE" ]]; then
+  rm -f "$cstate"
+  report "CLUSTER UNREACHABLE (no health response from OpenSearch)"
+elif [[ "${unassigned:-0}" -gt 0 ]]; then
+  rm -f "$cstate"
+  report "CLUSTER ${health} (${unassigned} shards unassigned - data unavailable)"
+elif [[ -f "$cstate" ]]; then
+  report "CLUSTER ${health} for two consecutive checks (${initializing:-0} shards still recovering)"
+else
+  # First sighting of a recovering cluster. Stay quiet; if it has not settled by
+  # the next run the branch above reports it.
+  touch "$cstate"
+fi
 
 docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SENSOR_CONTAINER" \
   || report "SENSOR DOWN (${SENSOR_CONTAINER} not running)"
