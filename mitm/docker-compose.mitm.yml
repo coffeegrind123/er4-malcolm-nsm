@@ -14,6 +14,9 @@ services:
       INTERCEPT_PORTS: "${MITM_INTERCEPT_PORTS:-80 443}"
       MITM_MAX_BODY: "${MITM_MAX_BODY:-8192}"
       MITM_CAPTURE_BODIES: "${MITM_CAPTURE_BODIES:-true}"
+      # false = capture Authorization/Cookie/API keys verbatim
+      MITM_REDACT_HEADERS: "${MITM_REDACT_HEADERS:-true}"
+      MITM_REDACT_EXTRA: "${MITM_REDACT_EXTRA:-}"
     ports:
       - "${MITM_LISTEN_PORT:-8080}:8080"
       - "${MITM_WEB_PORT:-8081}:8081"

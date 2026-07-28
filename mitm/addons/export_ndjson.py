@@ -7,7 +7,7 @@ to Arkime and let it decrypt the router's pcaps" is not a real path. Both ends
 of that idea are false.
 
 What does work: mitmproxy already holds the plaintext, so it writes the
-decrypted metadata and content here, filebeat shifts the file, and it lands in
+decrypted metadata and content here, tools/mitm-ingest ships it, and it lands in
 OpenSearch alongside the passive capture. One line per flow.
 
 Field names deliberately mirror the passive schema (source.ip, destination.ip,
@@ -26,13 +26,30 @@ OUT = os.environ.get("MITM_NDJSON", "/flows/mitm-flows.ndjson")
 MAX_BODY = int(os.environ.get("MITM_MAX_BODY", "8192"))
 CAPTURE_BODIES = os.environ.get("MITM_CAPTURE_BODIES", "true").lower() == "true"
 
-# Never persist these, decrypted or not. The point of the exercise is seeing
-# where traffic goes and what it carries structurally - not harvesting
-# credentials into a searchable index that outlives the investigation.
+# Credential headers. Redacted by default so that a casual "let me see what my
+# network is doing" does not quietly build a searchable store of session tokens.
+#
+# Set MITM_REDACT_HEADERS=false for full fidelity - forensics, debugging your own
+# auth flows, reproducing a failing request. Everything is then written verbatim,
+# which is the point, and the flow index becomes credential material: anyone with
+# read access to OpenSearch can replay those sessions, and the tokens stay valid
+# until they expire or are rotated.
+REDACT = os.environ.get("MITM_REDACT_HEADERS", "true").lower() != "false"
+
 REDACT_HEADERS = {
     "authorization", "proxy-authorization", "cookie", "set-cookie",
     "x-api-key", "x-auth-token", "api-key", "x-csrf-token",
 }
+# Add your own with MITM_REDACT_EXTRA="x-session,x-internal-token"
+REDACT_HEADERS |= {
+    h.strip().lower()
+    for h in os.environ.get("MITM_REDACT_EXTRA", "").split(",")
+    if h.strip()
+}
+
+if not REDACT:
+    print("[export_ndjson] MITM_REDACT_HEADERS=false - capturing credential "
+          "headers verbatim; treat mitm-flows-* as secret material")
 
 
 def _body(message) -> dict:
@@ -51,6 +68,8 @@ def _body(message) -> dict:
 
 
 def _headers(message) -> dict:
+    if not REDACT:
+        return {k.lower(): v for k, v in message.headers.items()}
     return {
         k.lower(): ("<redacted>" if k.lower() in REDACT_HEADERS else v)
         for k, v in message.headers.items()
@@ -79,6 +98,9 @@ def response(flow: http.HTTPFlow) -> None:
             },
             "tls": {"version": flow.client_conn.tls_version,
                     "sni": flow.client_conn.sni},
+            # Stamped per document: without it you cannot tell whether an empty
+            # authorization field means "no credential" or "redacted at capture".
+            "mitm": {"redacted": REDACT},
         }
         with open(OUT, "a") as fh:
             fh.write(json.dumps(rec, default=str) + "\n")

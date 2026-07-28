@@ -341,5 +341,12 @@ Separate index, same field names as the passive schema — `source.ip`,
 `destination.ip`, `url.full` — so a query written for one works against the
 other. Add `mitm-flows-*` as an index pattern to chart it in Dashboards.
 
-Credential headers are stored as `<redacted>`. Bodies are truncated at
-`MITM_MAX_BODY`. Treat the index as sensitive: it contains decrypted payloads.
+Credential headers are stored as `<redacted>` by default;
+`MITM_REDACT_HEADERS=false` stores them verbatim for full-fidelity forensics.
+Each document records which mode it was captured under:
+
+```sh
+tools/osapi ppl 'source=mitm-flows-* | stats count() by `mitm.redacted`'
+```
+
+Treat the index as sensitive either way — it contains decrypted payloads.

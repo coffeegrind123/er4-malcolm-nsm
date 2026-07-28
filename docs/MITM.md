@@ -108,20 +108,44 @@ everything else.
 
 ---
 
-## Credentials are redacted before they are stored
+## Credential capture
 
-`Authorization`, `Cookie`, `Set-Cookie`, `X-API-Key` and friends are replaced
-with `<redacted>` **before anything is written**. Bodies are truncated at
-`MITM_MAX_BODY` and can be disabled entirely with `MITM_CAPTURE_BODIES=false`.
+Two modes, both verified:
 
-This matters more than it sounds. Decrypting your own network produces a
-searchable index of everything your devices send, and without redaction that
-includes session tokens and passwords in a store that outlives the reason you
-were looking. Verified working: a request carrying `Authorization: Bearer ...`
-is stored with the header value redacted and the rest of the flow intact.
+```sh
+MITM_REDACT_HEADERS=true    # default - Authorization/Cookie/API keys -> <redacted>
+MITM_REDACT_HEADERS=false   # full fidelity - everything stored verbatim
+MITM_REDACT_EXTRA="x-session,x-internal-token"   # additional headers to mask
+```
 
-Treat the flow index as sensitive regardless. It is on `DATA_ROOT`, it is not
-gitignored by accident, and it should never be committed or exported.
+Redaction is only the default so that "let me see what my network is doing" does
+not quietly build a searchable store of session tokens. **It is not a
+recommendation.** For forensics, for debugging your own auth flows, or for
+reproducing a failing request, you want the real header and turning it off is
+the correct call.
+
+What changes when it is off: the flow index becomes credential material. Anyone
+with read access to OpenSearch can lift a session token and replay it, and those
+tokens stay valid until they expire or are rotated. That is a statement about
+where the index lives and who can read it, not a reason to avoid the setting.
+
+Every document records which mode captured it:
+
+```sh
+tools/osapi ppl 'source=mitm-flows-* | stats count() by `mitm.redacted`'
+```
+
+Without that stamp an empty `authorization` field is ambiguous — no credential
+sent, or redacted at capture? Verified both ways: with redaction on, a
+`Bearer` token stores as `<redacted>` while `user-agent` and the rest of the
+flow survive intact; with it off, the token and cookie are stored verbatim.
+
+Bodies are separate: truncated at `MITM_MAX_BODY`, disabled with
+`MITM_CAPTURE_BODIES=false`.
+
+Treat the flow index as sensitive in either mode — it holds decrypted payloads.
+It lives on `DATA_ROOT`, and `*.ndjson` is gitignored so an export cannot be
+committed by accident.
 
 ---
 
