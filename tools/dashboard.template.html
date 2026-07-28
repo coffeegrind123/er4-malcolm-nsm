@@ -410,9 +410,22 @@ function healthItems() {
         if (c.length) {
           /* Emphasis, not a rainbow: the largest consumer is the story, the
              rest are context. One accent hue, everything else recessive. */
-          d.append(el(`<div class="sub" style="margin-top:6px">largest consumers</div>`));
-          d.append(table([{ key: "n", label: "container" }, { key: "m", label: "MB", num: true }],
-            c.slice(0, 5).map((x, i) => ({ n: x.name, m: x.mb.toLocaleString(), bar: i === 0 ? x.mb : null }))));
+          /* COLLAPSE OUR OWN STACK INTO ONE ROW, do not hide it.
+             This table answers "who is eating the memory", and on this host the
+             honest answer is the monitoring stack itself - so filtering it out
+             entirely would leave a table that is clean and useless. Rolled into
+             a single line it stops crowding out everything else while still
+             stating its own cost. The header toggle breaks it back out. */
+          const mine = c.filter(x => x.stack), other = c.filter(x => !x.stack);
+          const rows = SHOW_INFRA() || !mine.length
+            ? c.slice(0, 6).map((x, i) => ({ n: esc(x.name), m: x.mb.toLocaleString(), bar: i === 0 ? x.mb : null }))
+            : [{ n: `<b>monitoring stack</b> <span class="muted">${mine.length} containers</span>`,
+                 m: mine.reduce((a, x) => a + x.mb, 0).toLocaleString(),
+                 bar: mine.reduce((a, x) => a + x.mb, 0) },
+               ...other.slice(0, 5).map(x => ({ n: esc(x.name), m: x.mb.toLocaleString(), bar: null }))];
+          d.append(el(`<div class="sub" style="margin-top:6px">largest consumers${
+            SHOW_INFRA() || !mine.length ? "" : " &middot; our own stack rolled up; tick “show our own stack” to itemise"}</div>`));
+          d.append(table([{ key: "n", label: "container", raw: true }, { key: "m", label: "MB", num: true }], rows));
         }
         return d;
       } });
@@ -945,7 +958,7 @@ async function start() {
   tick = setInterval(updateAge, 5000);
 }
 document.getElementById("range").onchange = () => { RANGE = document.getElementById("range").value; renderNetwork(); };
-document.getElementById("infra").onchange = () => renderNetwork();
+document.getElementById("infra").onchange = () => { renderHealth(); renderNetwork(); };
 document.getElementById("refresh").onclick = () => { loadStatus(); renderNetwork(); };
 start();
 </script>

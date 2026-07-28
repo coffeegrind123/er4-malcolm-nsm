@@ -159,9 +159,15 @@ def consumers():
         v = float(m.group(1))
         unit = m.group(2)
         mb = v * 1024 if unit.startswith("G") else v / 1024 if unit.startswith("K") else v
-        rows.append({"name": name, "mb": round(mb)})
+        # Mark our own containers so the console can collapse them into one row.
+        # Everything the monitoring stack runs: the Malcolm compose project, the
+        # sensor and probe, and the agent session that is driving all this.
+        project = os.environ.get("COMPOSE_PROJECT") or os.path.basename(
+            os.environ.get("MALCOLM_DIR", "malcolm").rstrip("/"))
+        ours = name.startswith(project + "-") or name.startswith("er4-") or name == "claude"
+        rows.append({"name": name, "mb": round(mb), "stack": bool(ours)})
     rows.sort(key=lambda r: -r["mb"])
-    return rows[:8]
+    return rows[:14]
 
 
 def watchers():
