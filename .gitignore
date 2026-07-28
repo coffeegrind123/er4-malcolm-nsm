@@ -12,3 +12,10 @@ data/
 # Python
 __pycache__/
 *.pyc
+
+# TLS interception artefacts. The CA private key would let anyone impersonate
+# any site to a device that trusts it; the flow export contains decrypted
+# payloads. Neither belongs in a repository.
+mitm/ca/
+*.ndjson
+.mitm-flows.tmp

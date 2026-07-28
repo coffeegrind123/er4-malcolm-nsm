@@ -325,3 +325,21 @@ Two things that will show up there and are not misconfigurations:
 first label, but so do CDN and telemetry hostnames — `ohttp-relay-safebrowsing-
 chrome.google.fastly-edge.com` tops the list on a perfectly clean network.
 Eyeball the names; do not alert on the score.
+
+## Decrypted flows
+
+If TLS interception is enabled (see [MITM.md](MITM.md)), decrypted HTTP lands in
+`mitm-flows-*`:
+
+```sh
+tools/osapi ppl 'source=mitm-flows-* | stats count() by `url.domain` | sort - `count()` | head 20'
+tools/osapi ppl 'source=mitm-flows-* | where `http.response.status_code` >= 400 | fields `url.full`, `http.response.status_code` | head 20'
+tools/osapi es GET 'mitm-flows-*/_search?q=url.domain:example.com&size=5'
+```
+
+Separate index, same field names as the passive schema — `source.ip`,
+`destination.ip`, `url.full` — so a query written for one works against the
+other. Add `mitm-flows-*` as an index pattern to chart it in Dashboards.
+
+Credential headers are stored as `<redacted>`. Bodies are truncated at
+`MITM_MAX_BODY`. Treat the index as sensitive: it contains decrypted payloads.

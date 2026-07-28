@@ -1,0 +1,35 @@
+# TLS interception node. Started only by `./install.sh mitm` - never by the
+# default install, because unlike everything else here it modifies traffic.
+services:
+  er4-mitm:
+    image: er4-mitm
+    build:
+      context: .
+    container_name: er4-mitm
+    restart: unless-stopped
+    environment:
+      MODE: "${MITM_MODE:-proxy}"
+      LISTEN_PORT: "${MITM_LISTEN_PORT:-8080}"
+      WEB_PORT: "${MITM_WEB_PORT:-8081}"
+      INTERCEPT_PORTS: "${MITM_INTERCEPT_PORTS:-80 443}"
+      MITM_MAX_BODY: "${MITM_MAX_BODY:-8192}"
+      MITM_CAPTURE_BODIES: "${MITM_CAPTURE_BODIES:-true}"
+    ports:
+      - "${MITM_LISTEN_PORT:-8080}:8080"
+      - "${MITM_WEB_PORT:-8081}:8081"
+      - "51820:51820/udp"
+    # NET_ADMIN + TUN are for transparent mode (tunnel, iptables REDIRECT).
+    # Harmless in proxy mode, and keeping one image avoids a second build.
+    cap_add: [NET_ADMIN, NET_RAW]
+    devices: ["/dev/net/tun:/dev/net/tun"]
+    sysctls: { net.ipv4.ip_forward: "1" }
+    volumes:
+      - type: bind
+        source: ${MITM_CA_DIR_WIN}
+        target: /ca
+      - type: bind
+        source: ${MITM_FLOWS_DIR_WIN}
+        target: /flows
+    logging:
+      driver: json-file
+      options: { max-size: "10m", max-file: "3" }

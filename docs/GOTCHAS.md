@@ -439,3 +439,45 @@ requires either terminating TLS (a MITM proxy plus a CA installed on every
 client, which certificate-pinned devices will refuse) or obtaining session keys
 from the client (`SSLKEYLOGFILE`), which decrypts retroactively because the full
 packets are already on disk.
+
+---
+
+## TLS interception
+
+### Handing TLS keys to Arkime does not work — neither half of it
+The obvious way to make decryption fit the existing stack is: export TLS master
+secrets from the proxy, point Arkime at them, and let it decrypt the pcaps the
+router already captured. It is wrong twice, and both halves were tested rather
+than assumed:
+
+- **mitmproxy writes no keylog for sessions it terminates.** Setting
+  `SSLKEYLOGFILE` produces no file at all.
+- **Arkime has no keylog-based decryption.** There is no such option; searching
+  its config and `capture --help` for keylog/secret returns nothing.
+
+What works is exporting the decrypted flows from the proxy directly — it already
+holds the plaintext — as NDJSON, and shipping that into OpenSearch
+(`tools/mitm-ingest`).
+
+### Decrypted flows go in their own index, not the session index
+`mitm-flows-*`, not `arkime_sessions3-*`. Malcolm owns that index and its
+mappings; a foreign document shape risks mapping conflicts that break the
+passive pipeline — the one thing that must keep working. Field names still
+mirror the passive schema so queries transfer.
+
+Set an explicit index template. Without one, OpenSearch infers the mapping from
+the first document, and a response body that happens to look like a date or a
+number poisons the field for every later flow.
+
+### The proxy cannot recover the destination behind a DNAT
+mitmproxy transparent mode uses `SO_ORIGINAL_DST`, which is populated by a
+**local** iptables REDIRECT. A DNAT from an upstream router rewrites the
+destination before the packet arrives, so the proxy has no idea where the client
+was going. The router must *route* (policy routing) rather than *translate*, and
+the interception node needs a path that preserves the original destination — a
+tunnel, since macvlan cannot give a Docker Desktop container a LAN presence.
+
+### Alpine ships neither mitmproxy nor wireguard-go
+Hence the Debian base. And install the userspace WireGuard backend in the *same*
+layer as the rest: a separate `RUN ... || true` produced an image with `wg-quick`
+present and no backend at all, which fails at run time instead of build time.

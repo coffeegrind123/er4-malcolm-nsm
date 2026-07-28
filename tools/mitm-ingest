@@ -1,0 +1,116 @@
+#!/usr/bin/env python3
+"""Ship decrypted mitmproxy flows into OpenSearch.
+
+    tools/mitm-ingest            follow and ship continuously
+    tools/mitm-ingest --once     ship what is there and exit
+
+Writes to its own `mitm-flows-*` index rather than into `arkime_sessions3-*`.
+That is deliberate: Malcolm owns the session index and its mappings, and
+injecting a foreign document shape into it risks mapping conflicts that would
+break the passive pipeline. A separate index costs one extra index pattern and
+keeps the two failure domains apart.
+
+Field names still mirror the passive schema (source.ip, destination.ip,
+url.full), so the same query works against either.
+"""
+import argparse
+import json
+import os
+import subprocess
+import sys
+import time
+from pathlib import Path
+
+HERE = Path(__file__).resolve().parent
+OSAPI = str(HERE / "osapi")
+STATE = Path(os.environ.get("MITM_INGEST_STATE", "/tmp/er4-mitm-ingest.offset"))
+INDEX_PREFIX = "mitm-flows"
+
+
+def es(method: str, path: str, body: str = "") -> dict:
+    cmd = [OSAPI, "es", method, path] + ([body] if body else [])
+    out = subprocess.run(cmd, capture_output=True, text=True, timeout=180).stdout
+    try:
+        return json.loads(out)
+    except json.JSONDecodeError:
+        return {"_raw": out[:200]}
+
+
+def ensure_template() -> None:
+    """Map body text as `text` and everything identifying as `keyword`.
+
+    Without an explicit mapping OpenSearch guesses from the first document it
+    sees, and a body that happens to look like a date or a number poisons the
+    mapping for every later flow.
+    """
+    es("PUT", f"_index_template/{INDEX_PREFIX}", json.dumps({
+        "index_patterns": [f"{INDEX_PREFIX}-*"],
+        "template": {
+            "settings": {"number_of_shards": 1, "number_of_replicas": 0},
+            "mappings": {"dynamic_templates": [
+                {"bodies": {"path_match": "http.*.body.text",
+                            "mapping": {"type": "text"}}},
+                {"headers": {"path_match": "http.*.headers.*",
+                             "mapping": {"type": "keyword", "ignore_above": 1024}}},
+                {"strings": {"match_mapping_type": "string",
+                             "mapping": {"type": "keyword", "ignore_above": 2048}}},
+            ]},
+        },
+    }))
+
+
+def ship(lines: list) -> int:
+    if not lines:
+        return 0
+    idx = f"{INDEX_PREFIX}-{time.strftime('%y%m%d')}"
+    bulk = []
+    for ln in lines:
+        try:
+            json.loads(ln)
+        except json.JSONDecodeError:
+            continue
+        bulk.append(json.dumps({"index": {"_index": idx}}))
+        bulk.append(ln.strip())
+    if not bulk:
+        return 0
+    res = es("POST", "_bulk", "\n".join(bulk) + "\n")
+    if res.get("errors"):
+        first = next((i for i in res.get("items", []) if "error" in i.get("index", {})), None)
+        if first:
+            print(f"  bulk error: {first['index']['error'].get('reason','')[:120]}", file=sys.stderr)
+    return len(bulk) // 2
+
+
+def main() -> int:
+    ap = argparse.ArgumentParser()
+    ap.add_argument("--file", default=os.environ.get(
+        "MITM_NDJSON_HOST", "/tmp/mitm-flows.ndjson"))
+    ap.add_argument("--once", action="store_true")
+    args = ap.parse_args()
+
+    ensure_template()
+    path = Path(args.file)
+    offset = int(STATE.read_text()) if STATE.exists() else 0
+
+    while True:
+        if path.exists():
+            size = path.stat().st_size
+            # Truncation (rotation) must reset the offset, or nothing is ever
+            # shipped again — the reader would sit past the end of a new file.
+            if size < offset:
+                offset = 0
+            with path.open() as fh:
+                fh.seek(offset)
+                lines = fh.readlines()
+                offset = fh.tell()
+            n = ship(lines)
+            if n:
+                print(f"  shipped {n} flows")
+            STATE.write_text(str(offset))
+        if args.once:
+            return 0
+        time.sleep(10)
+
+
+if __name__ == "__main__":
+    sys.exit(main())

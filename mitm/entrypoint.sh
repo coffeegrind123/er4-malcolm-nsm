@@ -20,12 +20,16 @@ log() { echo "[$(date -u '+%Y-%m-%dT%H:%M:%SZ')] mitm: $*"; }
 
 mkdir -p "$CA_DIR" "$(dirname "$KEYLOG")"
 
-# The TLS master secrets are the whole point of this node. mitmproxy writes them
-# here, and Arkime/Zeek use them to decrypt the pcaps the router already
-# captured - so decrypted traffic shows up in the existing Malcolm UI rather
-# than in a second, disconnected tool.
-export SSLKEYLOGFILE="$KEYLOG"
-log "TLS secrets -> ${KEYLOG}"
+# Decrypted flows are exported as NDJSON and shipped into OpenSearch, so they
+# sit alongside the passive capture instead of in a separate tool.
+#
+# NOT via a TLS keylog: mitmproxy does not write one for sessions it terminates
+# (SSLKEYLOGFILE produces nothing), and Arkime has no keylog-based decryption
+# anyway. Both halves of that idea were verified false before this was written.
+export MITM_NDJSON="${MITM_NDJSON:-/flows/mitm-flows.ndjson}"
+mkdir -p "$(dirname "$MITM_NDJSON")"
+ADDON="/addons/export_ndjson.py"
+log "decrypted flows -> ${MITM_NDJSON}"
 
 if [[ "$MODE" == "transparent" ]]; then
   if [[ ! -f "$TUNNEL_CONF" ]]; then
@@ -57,6 +61,7 @@ if [[ "$MODE" == "transparent" ]]; then
     --listen-port "$LISTEN_PORT" \
     --set confdir="$CA_DIR" \
     --set block_global=false \
+    -s "$ADDON" \
     ${MITM_EXTRA_ARGS:-}
 fi
 
@@ -67,4 +72,5 @@ exec mitmweb \
   --web-host 0.0.0.0 --web-port "$WEB_PORT" \
   --set confdir="$CA_DIR" \
   --set block_global=false \
+  -s "$ADDON" \
   ${MITM_EXTRA_ARGS:-}

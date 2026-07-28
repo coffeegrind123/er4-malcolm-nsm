@@ -23,6 +23,7 @@ RUN apt-get update && apt-get install -y --no-install-recommends \
 # at all - wg-quick was present, wireguard-go was not, and transparent mode
 # would have failed at runtime rather than at build time.
 
+COPY addons/ /addons/
 COPY entrypoint.sh /usr/local/bin/entrypoint.sh
 RUN chmod +x /usr/local/bin/entrypoint.sh
 

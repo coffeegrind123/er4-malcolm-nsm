@@ -118,6 +118,18 @@ setup steps that script would otherwise have done (see
 - The router key is a dedicated keypair; password login is left working as a
   fallback and nothing else about the router's configuration is changed.
 
+## TLS interception (optional)
+
+Everything above is passive — it observes without touching traffic. If you also
+need payloads, `./install.sh mitm` adds an interception node, and
+**[docs/MITM.md](docs/MITM.md)** covers it properly: proxy vs transparent mode,
+why the router must policy-route rather than DNAT, automating client proxy
+config via WPAD, and why the CA can never be installed automatically.
+
+It is off by default and scoped to named clients. Credential headers are
+redacted before anything is stored, and certificate-pinned devices will break
+rather than be intercepted — that is the app working correctly, not a bug.
+
 ## Using it
 
 **[docs/API.md](docs/API.md)** — everything in Dashboards Management, Data
