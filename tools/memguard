@@ -1,0 +1,301 @@
+#!/usr/bin/env bash
+# Keep host memory pressure from turning into a corrupt index.
+#
+#   tools/memguard            report: current state, trend, and what it would do
+#   tools/memguard --sample   record one datapoint (cheap; the watchdog calls this)
+#   tools/memguard --act      run the mitigation ladder as far as the state warrants
+#   tools/memguard --act --force-stage N   run stage N regardless (for testing)
+#
+# THE PROBLEM THIS ADDRESSES
+#
+# docs/GOTCHAS.md: an out-of-memory HOST makes OpenSearch fail a flush, and Lucene
+# reports that as CorruptIndexException. The shard is then unassignable and the
+# only way out is to delete the index. arkime_stats_v30 was lost that way.
+#
+# The collector shares a 22 GB host with heavy compute jobs, so the pressure
+# itself cannot be fixed from this repo - only moving one workload off the host
+# does that. What CAN be fixed is the two things that made the last incident
+# unsurvivable:
+#
+#   1. the warning arrived too late to act on  -> trend, and the right counter
+#   2. nothing acted on it but a human         -> the ladder below
+#
+# WATCH MemFree, NOT ONLY MemAvailable
+#
+# The original check watched MemAvailable alone, and MemAvailable counts page
+# cache as if it were already yours. Measured on this host during development:
+#
+#     MemFree 546 MB   MemAvailable 6,590 MB     <- looks fine, is not
+#     after dropping the page cache:
+#     MemFree 5,907 MB MemAvailable 6,662 MB     <- available barely moved
+#
+# So a host one page-cache-reclaim away from trouble is INVISIBLE to an
+# available-only check. That matters here specifically because the page cache is
+# backing a 9p mount that is 60-100x slower than local disk, so reclaiming it is
+# slow - and an allocation that cannot wait for slow reclaim is exactly what
+# fails. Both counters are tracked, and the ladder's first rung converts cache
+# straight into free memory.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OSAPI="${HERE}/osapi"
+. "${HERE}/_config.sh"
+
+STATE_DIR="${STATE_DIR:-${TMPDIR:-/tmp}/er4-watchdog}"
+SAMPLES="${STATE_DIR}/memory.samples"
+mkdir -p "$STATE_DIR"
+
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+
+MEM_WARN_MB="${MEM_WARN_MB:-1400}"              # MemAvailable floor
+MEM_FREE_WARN_MB="${MEM_FREE_WARN_MB:-800}"     # MemFree floor - the one that bites
+MEM_CRIT_MB="${MEM_CRIT_MB:-$((MEM_WARN_MB * 2 / 3))}"
+# Projected crossing inside this many minutes counts as a warning even while the
+# current reading is still comfortable. This is the whole point: with only ~190 MB
+# between routine operation and the corruption incident, a level trigger cannot be
+# early. A trend can.
+MEM_LEAD_MINS="${MEM_LEAD_MINS:-30}"
+MEM_SAMPLE_KEEP="${MEM_SAMPLE_KEEP:-720}"       # ~60h at one sample per 5 min
+
+ACT=0; SAMPLE_ONLY=0; ETA_ONLY=0; RESTORE_ONLY=0; FORCE_STAGE=0
+while [[ $# -gt 0 ]]; do
+  case "$1" in
+    --act) ACT=1 ;;
+    --sample) SAMPLE_ONLY=1 ;;
+    # Cheap machine-readable modes for the watchdog, which runs every 5 minutes:
+    # the full report shells out to `docker stats` and samples again, so calling
+    # it three times a run (as the first wiring did) both skewed the sample
+    # history and cost a second of docker on every check.
+    --eta) ETA_ONLY=1 ;;
+    --restore) RESTORE_ONLY=1 ;;
+    --force-stage) FORCE_STAGE="${2:-0}"; shift ;;
+    *) ;;
+  esac
+  shift
+done
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+
+read_mem() { # -> avail free swap_pct  (all MB / percent)
+  awk '/^MemAvailable:/{a=int($2/1024)}
+       /^MemFree:/{f=int($2/1024)}
+       /^SwapTotal:/{st=int($2/1024)}
+       /^SwapFree:/{sf=int($2/1024)}
+       END{printf "%d %d %d\n", a, f, (st>0 ? (st-sf)*100/st : 0)}' /proc/meminfo
+}
+
+sample() {
+  local avail free swap
+  read -r avail free swap < <(read_mem)
+  printf '%s %s %s %s\n' "$(date -u +%s)" "$avail" "$free" "$swap" >> "$SAMPLES"
+  # Bound the file here rather than in a separate prune job: an unbounded state
+  # file in /tmp is the same silent-growth mistake this repo already fixed twice.
+  local n; n=$(wc -l < "$SAMPLES" 2>/dev/null || echo 0)
+  if [[ "$n" -gt "$MEM_SAMPLE_KEEP" ]]; then
+    tail -n "$MEM_SAMPLE_KEEP" "$SAMPLES" > "${SAMPLES}.tmp" && mv "${SAMPLES}.tmp" "$SAMPLES"
+  fi
+}
+
+# Least-squares slope over the samples inside the window, in MB per minute, plus
+# the projected minutes until the floor is crossed. A single first-vs-last
+# difference is too noisy here: memory on this host sawtooths with the compute
+# jobs, and two unlucky endpoints would either cry wolf or miss a real slide.
+trend() { # trend <window-mins> <column:2=avail,3=free> <floor>
+  local win="$1" col="$2" floor="$3"
+  [[ -f "$SAMPLES" ]] || { echo "0 -1 0"; return; }
+  awk -v now="$(date -u +%s)" -v win="$((win * 60))" -v col="$col" -v floor="$floor" '
+    $1 >= now - win { n++; x[n]=($1-now)/60; y[n]=$col; sx+=x[n]; sy+=y[n] }
+    END {
+      if (n < 4) { print "0 -1", n; exit }
+      mx=sx/n; my=sy/n
+      for (i=1;i<=n;i++) { num += (x[i]-mx)*(y[i]-my); den += (x[i]-mx)^2 }
+      slope = (den > 0) ? num/den : 0          # MB per minute
+      cur = y[n]
+      eta = -1
+      if (slope < -0.5) eta = (cur - floor) / (-slope)
+      printf "%.1f %.0f %d\n", slope, eta, n
+    }' "$SAMPLES"
+}
+
+top_consumers() {
+  # Which workload is actually eating the host. The real remedy for this problem
+  # is separating the monitoring stack from the compute jobs, and that argument
+  # needs numbers rather than an impression.
+  # Sort on absolute usage, converted to MB. NOT on MemPerc: that is a percentage
+  # of each container's OWN limit, so a 2 MB container with a 64 MB cap outranks
+  # a 700 MB one with no cap and the list is worse than useless.
+  docker stats --no-stream --format '{{.Name}}\t{{.MemUsage}}' 2>/dev/null \
+    | awk -F'\t' '{
+        split($2, p, " / "); v = p[1]
+        mb = v + 0
+        if (v ~ /GiB/) mb *= 1024
+        else if (v ~ /KiB/) mb /= 1024
+        else if (v ~ /B$/ && v !~ /iB/) mb /= 1048576
+        printf "%10.0f MB  %s\n", mb, $1
+      }' | sort -rn | head -6 | sed 's/^/      /'
+}
+
+# ---- the ladder --------------------------------------------------------------
+# Each rung reports the memory it actually reclaimed rather than asserting that
+# it helped. Rungs are ordered by how much they cost the running system: the
+# first is free, the last stops ingestion.
+
+stage1_drop_cache() {
+  local f0 f1 a0 a1 _s
+  read -r a0 f0 _s < <(read_mem)
+  # Docker Desktop's VM is where every container's page cache lives, and it is a
+  # different kernel from the WSL distro - so this has to be done from inside a
+  # privileged container, not with a write to the host's /proc.
+  docker run --rm --privileged alpine sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches' >/dev/null 2>&1 \
+    || { warn "stage 1: could not drop the VM page cache"; return 1; }
+  sleep 2
+  read -r a1 f1 _s < <(read_mem)
+  ok "stage 1 (page cache): MemFree ${f0} -> ${f1} MB  (+$((f1 - f0)) MB), MemAvailable ${a0} -> ${a1} MB"
+  # Deliberately noted: this is not free of charge. Everything the pipeline
+  # re-reads now comes back over 9p at 60-100x local-disk latency, so it is a
+  # pressure-relief valve, not something to run on a timer.
+  return 0
+}
+
+stage2_opensearch() {
+  local a0 a1 f0 f1 _s
+  read -r a0 f0 _s < <(read_mem)
+  # Clearing caches gives heap back to the JVM, which reduces the chance that a
+  # flush allocation is the one that fails. The flush matters more than the
+  # clear: it persists the translog, so if the host does fall over, less is
+  # in-flight and unrecovered.
+  "$OSAPI" es POST '_cache/clear' >/dev/null 2>&1
+  "$OSAPI" es POST '_flush' >/dev/null 2>&1
+  sleep 2
+  read -r a1 f1 _s < <(read_mem)
+  ok "stage 2 (OpenSearch caches cleared, translog flushed): MemAvailable ${a0} -> ${a1} MB"
+  return 0
+}
+
+stage3_shed_indexing() {
+  # Last resort, and the reasoning matters because stopping a service to protect
+  # data looks backwards.
+  #
+  # The corruption happens when OpenSearch tries to FLUSH while the host cannot
+  # allocate. Logstash is both the largest sheddable consumer (a 2 GB heap) and
+  # the thing generating those writes. Stopping it removes ~2-3 GB of resident
+  # memory AND takes the write pressure off the shard at the same time.
+  #
+  # Nothing is lost: filebeat holds its position in the Zeek logs and retries,
+  # captures stay on disk in processed/, and the sensor keeps capturing. The
+  # cost is ingest latency until it comes back.
+  local a0 a1 f0 f1 _s
+  read -r a0 f0 _s < <(read_mem)
+  warn "stage 3: stopping logstash to take write pressure off the shard"
+  (cd "$MALCOLM_DIR" && docker compose --profile malcolm stop logstash >/dev/null 2>&1) || {
+    warn "stage 3: could not stop logstash"; return 1; }
+  date -u +%s > "${STATE_DIR}/logstash.shed"
+  sleep 5
+  read -r a1 f1 _s < <(read_mem)
+  ok "stage 3: logstash stopped, MemAvailable ${a0} -> ${a1} MB (+$((a1 - a0)) MB)"
+  echo "      ingestion is paused. It restarts automatically once memory recovers,"
+  echo "      or immediately with: cd ${MALCOLM_DIR} && docker compose --profile malcolm start logstash"
+  return 0
+}
+
+# Bring indexing back when there is room for it again. Without this the stack
+# would sit degraded until a human noticed - a self-inflicted outage, which is
+# precisely the failure mode docs/GOTCHAS.md warns about for the watchdog.
+maybe_restore_indexing() {
+  local shed="${STATE_DIR}/logstash.shed"
+  [[ -f "$shed" ]] || return 0
+  local avail free _s
+  read -r avail free _s < <(read_mem)
+  # Require real headroom, not a marginal recovery, or it flaps.
+  if [[ "$avail" -gt $((MEM_WARN_MB * 2)) && "$free" -gt $((MEM_FREE_WARN_MB * 2)) ]]; then
+    if (cd "$MALCOLM_DIR" && docker compose --profile malcolm start logstash >/dev/null 2>&1); then
+      rm -f "$shed"
+      ok "memory recovered (${avail}MB available, ${free}MB free) - logstash restarted"
+    fi
+  else
+    warn "logstash is still shed (since $(date -u -d "@$(cat "$shed")" +%H:%M)Z); ${avail}MB available, need $((MEM_WARN_MB * 2))MB"
+  fi
+}
+
+# ---- main --------------------------------------------------------------------
+if [[ "$ETA_ONLY" -eq 1 ]]; then
+  # "<avail-eta-mins> <free-eta-mins>", -1 for "not falling / too few samples".
+  read -r _s aeta _n < <(trend 60 2 "$MEM_WARN_MB")
+  read -r _s feta _n < <(trend 60 3 "$MEM_FREE_WARN_MB")
+  echo "${aeta} ${feta}"
+  exit 0
+fi
+if [[ "$RESTORE_ONLY" -eq 1 ]]; then
+  maybe_restore_indexing
+  exit 0
+fi
+
+sample
+[[ "$SAMPLE_ONLY" -eq 1 ]] && exit 0
+
+read -r AVAIL FREE SWAP < <(read_mem)
+read -r SLOPE ETA NSAMP < <(trend 60 2 "$MEM_WARN_MB")
+read -r FSLOPE FETA _ < <(trend 60 3 "$MEM_FREE_WARN_MB")
+
+say "host memory"
+printf '    MemAvailable %5d MB (floor %d)    MemFree %5d MB (floor %d)    swap %d%%\n' \
+  "$AVAIL" "$MEM_WARN_MB" "$FREE" "$MEM_FREE_WARN_MB" "$SWAP"
+if [[ "$NSAMP" -lt 4 ]]; then
+  echo "    trend: not enough samples yet (${NSAMP}); the watchdog adds one every run"
+else
+  printf '    trend over 60m (%s samples): available %+.1f MB/min, free %+.1f MB/min\n' "$NSAMP" "$SLOPE" "$FSLOPE"
+  [[ "${ETA%.*}"  -ge 0 ]] && printf '    projected: MemAvailable reaches its floor in %s min\n' "$ETA"
+  [[ "${FETA%.*}" -ge 0 ]] && printf '    projected: MemFree reaches its floor in %s min\n' "$FETA"
+fi
+echo
+echo "    largest consumers:"
+top_consumers
+
+# Decide how far up the ladder this state warrants.
+stage=0
+[[ "${FETA%.*}" -ge 0 && "${FETA%.*}" -le "$MEM_LEAD_MINS" ]] && stage=1
+[[ "${ETA%.*}"  -ge 0 && "${ETA%.*}"  -le "$MEM_LEAD_MINS" ]] && stage=1
+[[ "$FREE"  -lt "$MEM_FREE_WARN_MB" ]] && stage=1
+[[ "$AVAIL" -lt "$MEM_WARN_MB" ]]      && stage=2
+[[ "$AVAIL" -lt "$MEM_CRIT_MB" ]]      && stage=3
+[[ "$FORCE_STAGE" -gt 0 ]] && stage="$FORCE_STAGE"
+
+if [[ "$stage" -eq 0 ]]; then
+  say "no action needed"
+  maybe_restore_indexing
+  exit 0
+fi
+
+say "warranted: stage ${stage}"
+if [[ "$ACT" -eq 0 ]]; then
+  echo "    would run:"
+  [[ "$stage" -ge 1 ]] && echo "      1. drop the Docker VM page cache"
+  [[ "$stage" -ge 2 ]] && echo "      2. clear OpenSearch caches and flush the translog"
+  [[ "$stage" -ge 3 ]] && echo "      3. stop logstash until memory recovers"
+  echo "    run with --act to execute"
+  exit 1
+fi
+
+[[ "$stage" -ge 1 ]] && stage1_drop_cache
+if [[ "$stage" -ge 2 ]]; then
+  # Re-read: stage 1 may have been enough, and stage 2 is not free - clearing
+  # caches costs query latency afterwards.
+  read -r AVAIL FREE SWAP < <(read_mem)
+  if [[ "$AVAIL" -lt "$MEM_WARN_MB" ]]; then
+    stage2_opensearch
+  else
+    ok "stage 1 was sufficient (${AVAIL}MB available) - stopping here"
+    exit 0
+  fi
+fi
+if [[ "$stage" -ge 3 ]]; then
+  read -r AVAIL FREE SWAP < <(read_mem)
+  if [[ "$AVAIL" -lt "$MEM_CRIT_MB" ]]; then
+    stage3_shed_indexing
+  else
+    ok "stage 2 was sufficient (${AVAIL}MB available) - not shedding indexing"
+  fi
+fi
+exit 0

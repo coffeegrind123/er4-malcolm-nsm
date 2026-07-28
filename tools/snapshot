@@ -1,0 +1,286 @@
+#!/usr/bin/env bash
+# Make an index loss survivable.
+#
+#   tools/snapshot init       register the repository and the daily policy
+#   tools/snapshot take [tag] snapshot now
+#   tools/snapshot list       what exists, how big, how old
+#   tools/snapshot verify     PROVE a snapshot restores, without touching live data
+#   tools/snapshot restore <snapshot> <index>   put an index back
+#   tools/snapshot status     policy state and last run
+#
+# WHY
+#
+# The failure this exists for is documented in docs/GOTCHAS.md: an out-of-memory
+# HOST makes OpenSearch fail a flush, Lucene reports that as CorruptIndexException,
+# and the shard becomes unassignable. `allocate_empty_primary` does not help - it
+# still opens the corrupt files - so the only way out is to DELETE the index. That
+# already happened here to arkime_stats_v30.
+#
+# The reason that was survivable is that arkime_stats holds UI graphs. The same
+# event against arkime_sessions3-* would take the sessions themselves, and the
+# handoff has been carrying "and that is not recoverable" as a known, accepted
+# risk ever since.
+#
+# It does not have to be. The host memory problem cannot be fixed from inside this
+# repo - the collector shares a machine with heavy compute jobs, and only moving
+# one of them off it actually fixes that. But "cannot prevent" and "cannot survive"
+# are different claims, and the second one was never true: a snapshot repository
+# costs no memory, no JVM and no long-running process, and turns an unrecoverable
+# corruption into a restore.
+#
+# WHAT IT COSTS
+#
+# Snapshots are incremental at the Lucene segment level, so after the first one
+# each run copies only new segments. They are throttled (SNAPSHOT_MAX_BYTES_PER_SEC)
+# so a snapshot cannot starve ingestion of IO, and scheduling is done by
+# OpenSearch's own job scheduler - which is already running - rather than by
+# anything new.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+OSAPI="${HERE}/osapi"
+. "${HERE}/_config.sh"
+
+REPO="${SNAPSHOT_REPO:-nsm}"
+POLICY="${SNAPSHOT_POLICY:-nsm-daily}"
+# What is worth keeping. Session data and decrypted flows are the irreplaceable
+# part; .kibana carries the dashboards and saved objects, which are painful
+# rather than impossible to rebuild.
+INDICES="${SNAPSHOT_INDICES:-arkime_*,mitm-flows-*,.kibana*}"
+RETENTION_DAYS="${SNAPSHOT_RETENTION_DAYS:-30}"
+MAX_BPS="${SNAPSHOT_MAX_BYTES_PER_SEC:-40mb}"
+CRON="${SNAPSHOT_CRON:-30 2 * * *}"
+# Available memory below which a manual snapshot refuses to start. Snapshotting
+# under memory pressure is asking the exact subsystem that is already struggling
+# to do more work - and the failure mode is the corruption this tool exists to
+# insure against.
+MEM_FLOOR_MB="${SNAPSHOT_MEM_FLOOR_MB:-${MEM_WARN_MB:-1400}}"
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+die()  { printf '    \033[31mfail\033[0m %s\n' "$*" >&2; exit 1; }
+
+jq_() { python3 -c "import sys,json
+try: d=json.load(sys.stdin)
+except Exception: sys.exit(0)
+$1"; }
+
+mem_avail() { awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo 2>/dev/null || echo 99999; }
+
+cmd_init() {
+  say "registering snapshot repository '${REPO}'"
+  # The location is relative to path.repo, which Malcolm already sets to
+  # /opt/opensearch/backup and already bind-mounts to the data disk. No compose
+  # change, no new mount, no restart - which matters, because a restart of
+  # OpenSearch under memory pressure is itself a risk.
+  local repos; repos=$("$OSAPI" es GET '_nodes/settings?filter_path=nodes.*.settings.path.repo' 2>/dev/null)
+  if ! grep -q 'repo' <<<"$repos"; then
+    die "path.repo is not configured on this cluster - a filesystem repository cannot be registered"
+  fi
+  ok "path.repo: $(sed 's/.*"repo":\[\([^]]*\)\].*/\1/' <<<"$repos")"
+
+  local body
+  body=$(printf '{"type":"fs","settings":{"location":"%s","compress":true,"max_snapshot_bytes_per_sec":"%s","max_restore_bytes_per_sec":"%s"}}' \
+         "$REPO" "$MAX_BPS" "$MAX_BPS")
+  "$OSAPI" es PUT "_snapshot/${REPO}" "$body" | grep -q '"acknowledged":true' \
+    || die "could not register the repository"
+  ok "repository registered (throttled to ${MAX_BPS})"
+
+  # Registering a repository proves nothing about whether it can be WRITTEN to -
+  # a wrong path or a permission problem shows up only on the first snapshot,
+  # which is the worst possible time to find out. Verify explicitly.
+  local v; v=$("$OSAPI" es POST "_snapshot/${REPO}/_verify" 2>/dev/null)
+  grep -q '"nodes"' <<<"$v" && ok "repository verified writable by the cluster" \
+    || die "repository verify failed: ${v}"
+
+  cmd_policy
+}
+
+cmd_policy() {
+  say "installing snapshot policy '${POLICY}'"
+  # Deletion is bounded three ways on purpose. max_age is the intent; max_count
+  # stops an unnoticed change to the schedule filling the disk; min_count is the
+  # important one - it refuses to delete the last few snapshots even if they are
+  # all older than the retention, so a stack that has been down for a month still
+  # has something to restore from.
+  local body
+  body=$(cat <<EOF
+{
+  "description": "Daily snapshot of the NSM indices so an OOM-corrupted shard can be restored instead of deleted.",
+  "creation": {
+    "schedule": {"cron": {"expression": "${CRON}", "timezone": "UTC"}},
+    "time_limit": "2h"
+  },
+  "deletion": {
+    "condition": {"max_age": "${RETENTION_DAYS}d", "max_count": 60, "min_count": 3}
+  },
+  "snapshot_config": {
+    "repository": "${REPO}",
+    "indices": "${INDICES}",
+    "ignore_unavailable": true,
+    "include_global_state": false,
+    "partial": false
+  }
+}
+EOF
+)
+  # Snapshot Management splits create and update across two verbs, and the error
+  # for getting it wrong names the wrong problem: a bare PUT of a policy that
+  # does not exist yet fails with "Sequence number and primary term must be
+  # provided when updating", which reads as a policy that is already there.
+  # Create with POST; only fall back to PUT (with the concurrency tokens) when
+  # the policy genuinely exists.
+  local r; r=$("$OSAPI" es POST "_plugins/_sm/policies/${POLICY}" "$body" 2>/dev/null)
+  if grep -q 'version_conflict\|already exists\|must be provided when updating' <<<"$r"; then
+    local seq pri
+    read -r seq pri < <("$OSAPI" es GET "_plugins/_sm/policies/${POLICY}" 2>/dev/null \
+      | jq_ 'print(d.get("_seq_no",-1), d.get("_primary_term",-1))')
+    r=$("$OSAPI" es PUT "_plugins/_sm/policies/${POLICY}?if_seq_no=${seq}&if_primary_term=${pri}" "$body" 2>/dev/null)
+  fi
+  grep -q '"sm_policy"\|"_id"' <<<"$r" \
+    && ok "policy installed: daily at cron '${CRON}' UTC, keep ${RETENTION_DAYS}d (never fewer than 3)" \
+    || warn "policy response: $(head -c 200 <<<"$r")"
+}
+
+cmd_take() {
+  local tag="${1:-manual}" name avail
+  avail=$(mem_avail)
+  if [[ "$avail" -lt "$MEM_FLOOR_MB" ]]; then
+    die "only ${avail}MB available (floor ${MEM_FLOOR_MB}MB) - snapshotting now risks the failure it insures against. Run tools/memguard first."
+  fi
+  name="${POLICY}-$(date -u +%Y%m%d-%H%M%S)-${tag}"
+  say "taking snapshot ${name}"
+  local body
+  body=$(printf '{"indices":"%s","ignore_unavailable":true,"include_global_state":false,"partial":false}' "$INDICES")
+  "$OSAPI" es PUT "_snapshot/${REPO}/${name}?wait_for_completion=true" "$body" \
+    | jq_ '
+s = d.get("snapshot", {})
+st = s.get("state","?")
+sh = s.get("shards",{})
+print("    state:", st, " shards:", sh.get("successful"), "/", sh.get("total"),
+      " took:", round(s.get("duration_in_millis",0)/1000,1), "s")
+print("    indices:", ", ".join(s.get("indices",[])[:8]))
+'
+}
+
+cmd_list() {
+  say "snapshots in '${REPO}'"
+  "$OSAPI" es GET "_snapshot/${REPO}/_all" 2>/dev/null | jq_ '
+snaps = d.get("snapshots", [])
+if not snaps:
+    print("    none yet"); raise SystemExit(0)
+for s in snaps[-15:]:
+    sh = s.get("shards", {})
+    print("    {:<44} {:<9} {:>4}/{:<4} shards  {}".format(
+        s.get("snapshot","?"), s.get("state","?"),
+        sh.get("successful",0), sh.get("total",0),
+        s.get("start_time","")[:19].replace("T"," ")))
+print("\n    {} snapshot(s) total".format(len(snaps)))
+'
+  local du
+  du=$(docker run --rm -v "${DATA_ROOT_WIN:-//d/malcolm-data}/opensearch-backup:/b" alpine \
+       sh -c "du -sh /b/${REPO} 2>/dev/null | cut -f1" 2>/dev/null)
+  [[ -n "$du" ]] && ok "repository on disk: ${du}"
+}
+
+# The control this repo's own conventions demand: do not ASSERT that snapshots
+# restore, demonstrate it. Restores into a renamed index, compares the document
+# count against the live one, and cleans up. Touches nothing that is in use.
+cmd_verify() {
+  local snap idx live restored
+  snap=$("$OSAPI" es GET "_snapshot/${REPO}/_all" 2>/dev/null \
+         | jq_ 'ss=[s for s in d.get("snapshots",[]) if s.get("state")=="SUCCESS"]
+print(ss[-1]["snapshot"] if ss else "")')
+  [[ -z "$snap" ]] && die "no successful snapshot to verify - run: tools/snapshot take"
+
+  say "verifying ${snap} by restoring it alongside the live data"
+  # Pick a session index that actually holds documents. Arkime ships a permanently
+  # empty "arkime_sessions3-initial" bootstrap index, and it sorts AFTER the
+  # date-stamped ones - so the obvious "take the newest by name" picks the one
+  # index that can never prove anything. A restore that returns 0 documents from
+  # a 0-document index is not evidence of a working repository.
+  idx=$("$OSAPI" es GET "_snapshot/${REPO}/${snap}" 2>/dev/null \
+        | jq_ 'import re
+ix=[i for i in d["snapshots"][0].get("indices",[]) if re.match(r"^arkime_sessions3-[0-9]{6}$", i)]
+print(sorted(ix)[-1] if ix else "")')
+  [[ -z "$idx" ]] && die "snapshot contains no session index to test with"
+  ok "test index: ${idx}"
+
+  live=$("$OSAPI" es GET "${idx}/_count" 2>/dev/null | jq_ 'print(d.get("count",-1))')
+  ok "live document count: ${live}"
+
+  "$OSAPI" es DELETE "restore-check-${idx}" >/dev/null 2>&1
+  local r
+  r=$("$OSAPI" es POST "_snapshot/${REPO}/${snap}/_restore?wait_for_completion=true" \
+      "{\"indices\":\"${idx}\",\"rename_pattern\":\"(.+)\",\"rename_replacement\":\"restore-check-\$1\",\"include_aliases\":false,\"index_settings\":{\"index.number_of_replicas\":0}}" 2>/dev/null)
+  if ! grep -q '"snapshot"' <<<"$r"; then
+    die "restore failed: $(head -c 300 <<<"$r")"
+  fi
+
+  # A restore returns as soon as the shards are allocated; the count is only
+  # meaningful after a refresh.
+  "$OSAPI" es POST "restore-check-${idx}/_refresh" >/dev/null 2>&1
+  restored=$("$OSAPI" es GET "restore-check-${idx}/_count" 2>/dev/null | jq_ 'print(d.get("count",-1))')
+  ok "restored document count: ${restored}"
+
+  "$OSAPI" es DELETE "restore-check-${idx}" >/dev/null 2>&1
+  ok "test index removed"
+
+  if [[ "${restored:-0}" -gt 0 && "${restored:-0}" -le "${live:-0}" ]]; then
+    say "VERIFIED: a corrupted ${idx} can be restored from ${snap}"
+    # Restored <= live is expected, not a fault: the index kept being written
+    # after the snapshot was taken. Zero, or an error, would be the failure.
+    [[ "$restored" -lt "$live" ]] && \
+      echo "    (${restored} vs ${live} live - the gap is traffic indexed since the snapshot)"
+  else
+    die "restore produced ${restored} documents against ${live} live - do not rely on this repository"
+  fi
+}
+
+cmd_restore() {
+  local snap="${1:-}" idx="${2:-}"
+  [[ -z "$snap" || -z "$idx" ]] && die "usage: tools/snapshot restore <snapshot> <index>"
+  say "restoring ${idx} from ${snap}"
+  # An open index cannot be restored over. The caller is expected to have
+  # deleted the corrupt one already - which, per GOTCHAS, is the only way out of
+  # a CorruptIndexException anyway - so say so plainly rather than deleting live
+  # data on their behalf.
+  local exists
+  exists=$("$OSAPI" es GET "_cat/indices/${idx}?h=index" 2>/dev/null | tr -d '[:space:]')
+  if [[ -n "$exists" ]]; then
+    die "${idx} still exists. Close or delete it first: tools/osapi es DELETE ${idx}"
+  fi
+  "$OSAPI" es POST "_snapshot/${REPO}/${snap}/${idx}/_restore?wait_for_completion=true" \
+    "{\"indices\":\"${idx}\",\"include_aliases\":true}" | head -c 400
+  echo
+  # Arkime addresses its indices through aliases; a restore that misses them
+  # leaves the data present and the application blind to it.
+  ok "restored - confirm the alias: tools/osapi es GET _cat/aliases/${idx%-*}"
+}
+
+cmd_status() {
+  say "policy ${POLICY}"
+  "$OSAPI" es GET "_plugins/_sm/policies/${POLICY}/_explain" 2>/dev/null | jq_ '
+for p in d.get("policies", []):
+    md = p.get("metadata") or {}
+    cr = md.get("creation") or {}
+    de = md.get("deletion") or {}
+    print("    enabled:      ", p.get("enabled"))
+    print("    last creation:", (cr.get("latest_execution") or {}).get("status","-"),
+          (cr.get("latest_execution") or {}).get("info",{}).get("message","") if cr.get("latest_execution") else "")
+    print("    trigger next: ", (cr.get("trigger") or {}).get("time","-"))
+    print("    last deletion:", (de.get("latest_execution") or {}).get("status","-"))
+' 2>/dev/null
+  cmd_list
+}
+
+case "${1:-help}" in
+  init)    shift; cmd_init "$@" ;;
+  policy)  shift; cmd_policy "$@" ;;
+  take)    shift; cmd_take "$@" ;;
+  list)    shift; cmd_list "$@" ;;
+  verify)  shift; cmd_verify "$@" ;;
+  restore) shift; cmd_restore "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  help|*)  sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac
