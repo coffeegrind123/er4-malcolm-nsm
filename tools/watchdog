@@ -28,7 +28,12 @@ OSAPI="${HERE}/osapi"
 MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
 PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
 ZEEK_MOUNT="${ZEEK_MOUNT:-//d/malcolm-data/zeek-logs}"
-MONITOR_CONTAINER="${MONITOR_CONTAINER:-malcolm-pcap-monitor-1}"
+# Compose derives the project name from the directory it runs in, and container
+# names are "<project>-<service>-1". Install to a differently-named directory and
+# every hardcoded "malcolm-*" lookup silently finds nothing — which here would
+# read as "the consumer emitted no events", i.e. a false stall on every check.
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+MONITOR_CONTAINER="${MONITOR_CONTAINER:-${COMPOSE_PROJECT}-pcap-monitor-1}"
 SENSOR_CONTAINER="${SENSOR_CONTAINER:-er4-sensor}"
 STALL_SECS="${STALL_SECS:-420}"
 # Where the head-of-queue tracking state lives (needed to spot a stranded head).
@@ -169,9 +174,8 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
 
 drain_container() { # map a compose service to its container name
   case "$1" in
-    filebeat)     echo "malcolm-filebeat-1" ;;
     pcap-monitor) echo "$MONITOR_CONTAINER" ;;
-    *)            echo "malcolm-${1}-1" ;;
+    *)            echo "${COMPOSE_PROJECT}-${1}-1" ;;
   esac
 }
 

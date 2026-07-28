@@ -408,3 +408,16 @@ tools/osapi es GET '_cluster/stats?filter_path=indices.store.size_in_bytes,indic
 `nginx-proxy` hard-depends on `netbox`, and nginx dies outright on a missing
 upstream (`host not found in upstream`), taking the whole UI with it. The heap
 is the safe lever.
+
+### Container names encode the compose project, which comes from the directory
+Compose names containers `<project>-<service>-1`, and takes `<project>` from the
+directory it runs in. Install to `/opt/nsm-malcolm` instead of `~/malcolm` and
+every hardcoded `malcolm-*` lookup finds nothing.
+
+That fails in the worst possible way for a health check: `docker logs` on a
+container that does not exist returns no output, which the watchdog reads as
+"the consumer produced no events" — a false stall on **every** run, and with
+`--heal` a restart loop against a perfectly healthy pipeline.
+
+`tools/watchdog` and `tools/osapi` derive it from `basename "$MALCOLM_DIR"`, and
+`COMPOSE_PROJECT` overrides it if you set one explicitly.

@@ -25,7 +25,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 BASE="${MALCOLM_BASE:-https://host.docker.internal}"
 USER_="${MALCOLM_USER:-admin}"
 PASS="$(cat "${MALCOLM_PW_FILE:-${HERE}/../keys/malcolm_pw}")"
-OS_CONTAINER="${OS_CONTAINER:-malcolm-opensearch-1}"
+# Container names are "<compose-project>-<service>-1", and compose takes the
+# project name from the install directory. Derive it rather than assuming.
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+OS_CONTAINER="${OS_CONTAINER:-${COMPOSE_PROJECT}-opensearch-1}"
 CERTS=/usr/share/opensearch/config/certs
 
 urlenc() { python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1], safe=''))" "$1"; }
