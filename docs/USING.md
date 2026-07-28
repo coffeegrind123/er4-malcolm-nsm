@@ -390,6 +390,29 @@ None of this fixes the underlying problem, which is that the collector shares a
 host with heavy compute jobs. `tools/memguard` prints the largest consumers so
 that argument can be made with numbers.
 
+**Before reaching for the ladder, check the heaps.** The ladder absorbs pressure;
+right-sizing removes it. Measure the live set rather than trusting "heap used" —
+a JVM fills what it is given:
+
+```sh
+tools/osapi es GET '_nodes/stats/jvm?filter_path=nodes.*.jvm.mem.pools.old,nodes.*.jvm.gc.collectors'
+```
+
+Old-gen occupancy and a full-GC count of zero mean the heap is oversized. Change
+`OPENSEARCH_HEAP` in `config.env`, re-run `./install.sh collector` (or edit
+`config/opensearch.env` directly) and restart that one service. Snapshot first.
+
+## Getting told about it
+
+```sh
+ALERT_WEBHOOK=https://ntfy.sh/your-private-topic   # in config.env
+```
+
+`tools/watchdog` posts its findings there whenever it reports anything, rate
+limited per problem-set so a condition lasting an hour pages once rather than
+twelve times. Unset, it stays silent. This matters more than any panel: the
+console is excellent while you are looking at it and useless at 04:00.
+
 ### `MEMORY LOW` / `SWAP PRESSURE`
 
 Act on these before anything else, and **do not restart your way out of them**.

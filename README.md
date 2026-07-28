@@ -119,6 +119,7 @@ pieces and queued — never discarded. See `config.env.example` and
 ### Keeping it alive
 
 ```sh
+./install.sh ops         # snapshots, console and stall probe, in one go
 tools/dashboard install  # one page for pipeline health + network, at https://<host>/nsm/
 tools/watchdog --heal    # detect and repair silent watcher stalls; run on a timer
 tools/memguard           # memory trend, largest consumers, mitigation ladder
@@ -138,7 +139,17 @@ real data before it was understood:
   repairing so the cause can eventually be pinned down.
 - **The Windows bind mount is 60-100x slower than local disk** and degrades far
   worse than that under contention. Most surprising behaviour in the pipeline
-  traces back to it.
+  traces back to it, and it is why `PCAP_RETENTION_DAYS` is a measured number
+  rather than a preference — retention multiplied by rotation gives the file
+  count, and the file count is what every poll pays for.
+
+**Size the JVM heaps against the data, and measure.** Malcolm's own `configure`
+sizes them from total system RAM, which is the wrong input twice. A JVM also
+fills whatever heap it is given before collecting, so the "heap used" figure
+reads high on an idle cluster — the live set is the old generation. Measured
+here: 2.58 GB "used" of 4 GB, but a 0.30 GB live set and zero full collections,
+so 4g was holding 2.1 GB of resident memory for nothing. See `config.env.example`
+for the one-line query.
 
 ## Security notes
 

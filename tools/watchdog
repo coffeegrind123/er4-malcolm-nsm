@@ -60,7 +60,8 @@ MEM_FREE_WARN_MB="${MEM_FREE_WARN_MB:-800}"
 SWAP_WARN_PCT="${SWAP_WARN_PCT:-85}"     # swap this full means the host is already thrashing
 MEM_LEAD_MINS="${MEM_LEAD_MINS:-30}"
 problems=0
-report() { echo "$*"; problems=$((problems + 1)); }
+ALL_PROBLEMS=""
+report() { echo "$*"; problems=$((problems + 1)); ALL_PROBLEMS="${ALL_PROBLEMS}${*}"$'\n'; }
 
 # A TREND warning is only worth printing if something was actually done about it.
 #
@@ -512,6 +513,34 @@ check_threads
 check_queue "pcap/upload"      "$PCAP_MOUNT" "upload/*.pcap"    "pcap-monitor"
 check_queue "zeek-logs/upload" "$ZEEK_MOUNT" "upload/*.tar.gz" "filebeat"
 
+# Send findings somewhere a human will actually see them.
+#
+# The console is excellent when someone is looking at it and useless at 04:00,
+# which is when a shard dies. Everything needed was already here - this script
+# exits non-zero with one line per problem - so the missing piece was three lines
+# of curl, not another dashboard.
+#
+# Opt-in and best-effort: unset means silent, and a webhook that is down must
+# never delay or fail a repair. Rate-limited per problem SET rather than per run,
+# so a condition that persists for an hour pages once instead of twelve times -
+# an alert channel that repeats itself is one people mute.
+notify() {
+  [[ -n "${ALERT_WEBHOOK:-}" && -n "$1" ]] || return 0
+  local fingerprint state last now
+  fingerprint=$(printf '%s' "$1" | sed 's/[0-9]\+//g' | md5sum | cut -c1-16)
+  state="${STATE_DIR}/alert.${fingerprint}"
+  now=$(date -u +%s)
+  last=0; [[ -f "$state" ]] && last=$(cat "$state" 2>/dev/null || echo 0)
+  [[ $(( now - last )) -lt "${ALERT_REPEAT_SECS:-3600}" ]] && return 0
+  echo "$now" > "$state"
+  # Trim state older than a day so /tmp does not accumulate one file per variant.
+  find "$STATE_DIR" -maxdepth 1 -name 'alert.*' -mtime +1 -delete 2>/dev/null || true
+  timeout 15 curl -fsS -X POST -H 'Content-Type: application/json' \
+    --data "$(python3 -c 'import json,sys; print(json.dumps({"text": sys.argv[1], "title": "NSM watchdog"}))' \
+              "$(hostname): $1")" \
+    "$ALERT_WEBHOOK" >/dev/null 2>&1 || true
+}
+
 # Refresh the console's status feed. Best-effort and time-bounded: the dashboard
 # is an output of this script, never a dependency of it, so a slow or broken
 # refresh must not delay a repair or change the exit status. The page displays
@@ -520,5 +549,8 @@ check_queue "zeek-logs/upload" "$ZEEK_MOUNT" "upload/*.tar.gz" "filebeat"
 if [[ -x "${HERE}/dashboard" ]]; then
   timeout 60 "${HERE}/dashboard" status >/dev/null 2>&1 || true
 fi
+
+# One notification per run carrying everything found, not one per problem.
+[[ "$problems" -gt 0 ]] && notify "$(printf '%s' "$ALL_PROBLEMS" | head -c 900)"
 
 exit $(( problems > 0 ))
