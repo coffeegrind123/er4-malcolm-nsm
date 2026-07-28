@@ -307,12 +307,26 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
     return 0
   fi
 
+  # Only claim the head is advancing when that has actually been OBSERVED, i.e.
+  # this is not the first sighting and the oldest entry changed since last run.
+  # It used to assert "head advancing" on the first sighting too, which is a
+  # claim about something it had not checked - and it is wrong in the exact case
+  # that matters: the mover happily drains new arrivals past a stranded head, so
+  # events flow, the count looks stable, and the report says everything is fine
+  # while the oldest capture sits there. Seen live at 17 minutes stuck.
+  local head_state
+  if [[ -z "$prev" ]]; then
+    head_state="head not yet re-checked - if it has not moved by the next run this is a stranded head"
+  else
+    head_state="head advancing"
+  fi
+
   if [[ "${drained:-0}" -gt 0 ]]; then
-    report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; draining - ${drained} events/5m, head advancing)"
+    report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; draining - ${drained} events/5m, ${head_state})"
     return 0
   fi
 
-  report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; head advancing)"
+  report "QUEUE BACKLOG: ${label} (${count} pending, oldest capture ${age}s old; ${head_state})"
 }
 
 drain_container() { # map a compose service to its container name
