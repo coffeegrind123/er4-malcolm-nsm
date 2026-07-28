@@ -82,6 +82,35 @@
   .flag.ok{background:var(--ok)} .flag.warn{background:var(--warn)} .flag.bad{background:var(--bad)}
   .stale{color:var(--warn)}
   code{background:#21262d;padding:1px 4px;border-radius:3px;font-size:11px}
+
+  /* Status carries a GLYPH and a WORD, never colour alone. The palette
+     validator measures warn(amber) against ok(green) at only ΔE 5.1 under
+     protanopia - indistinguishable for a red-blind reader - which is allowed
+     only with secondary encoding. The glyph is that encoding, not decoration. */
+  .st{font-weight:600;white-space:nowrap}
+  .st.ok{color:var(--ok)} .st.warn{color:var(--warn)} .st.bad{color:var(--bad)}
+  .st::before{margin-right:5px;font-size:11px}
+  .st.ok::before{content:"●"} .st.warn::before{content:"▲"} .st.bad::before{content:"✕"}
+
+  /* The banner is the hero: one line answering "is anything wrong", at a size
+     that does not have to compete with thirteen equal panels. */
+  #banner{padding:14px 16px 0;display:flex;gap:12px;align-items:baseline;flex-wrap:wrap}
+  #banner .hero{font-size:20px;font-weight:600;letter-spacing:-.2px}
+  #banner .why{color:var(--dim);font-size:12px}
+
+  /* KPI row: a healthy subsystem costs one tile, not a whole card. */
+  .kpirow{display:grid;gap:10px;grid-template-columns:repeat(auto-fit,minmax(168px,1fr))}
+  .kpi{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:9px 11px;cursor:pointer}
+  .kpi:hover{border-color:var(--accent)}
+  .kpi .k{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px}
+  .kpi .v{font-size:17px;font-weight:600;margin:2px 0 1px;font-variant-numeric:tabular-nums}
+  .kpi .s{font-size:11px}
+  .kpi.problem{border-color:var(--warn)}
+  .kpi.critical{border-color:var(--bad)}
+  h2.sect{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1.2px;
+          margin:6px 0 -4px;padding-bottom:5px;border-bottom:1px solid var(--line);font-weight:600}
+  .tip{position:fixed;pointer-events:none;background:#21262d;border:1px solid var(--line);
+       border-radius:5px;padding:4px 7px;font-size:11px;z-index:60;display:none;white-space:nowrap}
 </style>
 </head>
 <body>
@@ -103,10 +132,16 @@
   <a href="/dashboards/" target="_blank">Dashboards</a>
 </header>
 
+<div id="banner"><span class="hero">checking…</span></div>
 <main>
+  <section class="kpirow" id="kpi"></section>
   <section class="grid" id="health"></section>
+  <h2 class="sect">now</h2>
+  <section class="grid" id="now"></section>
+  <h2 class="sect">analysis</h2>
   <section class="grid" id="network"></section>
 </main>
+<div class="tip" id="tip"></div>
 
 <div id="drill">
   <button class="close" onclick="closeDrill()">close</button>
@@ -203,7 +238,10 @@ function table(cols, rows, opts = {}) {
   return t;
 }
 
-function sparkline(points, floor) {
+/* A plotted series ships with a hover layer by default - a line you cannot
+   interrogate is a decoration. Crosshair plus a tooltip naming the value and
+   the time, with a hit target far wider than the 1.4px stroke. */
+function sparkline(points, floor, unit) {
   if (points.length < 2) return el(`<div class="empty">not enough samples yet</div>`);
   const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
   const x0 = Math.min(...xs), x1 = Math.max(...xs);
@@ -211,10 +249,35 @@ function sparkline(points, floor) {
   const px = (x) => ((x - x0) / Math.max(1, x1 - x0)) * 100;
   const py = (y) => 100 - ((y - y0) / Math.max(1, y1 - y0)) * 100;
   const d = points.map((p, i) => `${i ? "L" : "M"}${px(p[0]).toFixed(2)},${py(p[1]).toFixed(2)}`).join(" ");
+  /* The floor line is labelled, not just coloured red - a dashed line the
+     reader has to guess the meaning of is worse than no line. */
   const fl = floor ? `<line x1="0" y1="${py(floor).toFixed(2)}" x2="100" y2="${py(floor).toFixed(2)}"
                        stroke="var(--bad)" stroke-width="0.8" stroke-dasharray="2,2" vector-effect="non-scaling-stroke"/>` : "";
-  return el(`<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none">
-    ${fl}<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"/></svg>`);
+  const svg = el(`<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none">
+    ${fl}<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"/>
+    <line class="cx" x1="0" y1="0" x2="0" y2="100" stroke="var(--dim)" stroke-width="0.6"
+          vector-effect="non-scaling-stroke" style="display:none"/>
+    <rect x="0" y="0" width="100" height="100" fill="transparent"/></svg>`);
+  const tip = document.getElementById("tip"), cx = svg.querySelector(".cx");
+  svg.addEventListener("mousemove", (e) => {
+    const r = svg.getBoundingClientRect();
+    const frac = (e.clientX - r.left) / r.width;
+    const tx = x0 + frac * (x1 - x0);
+    let best = points[0];
+    for (const p of points) if (Math.abs(p[0] - tx) < Math.abs(best[0] - tx)) best = p;
+    cx.style.display = ""; cx.setAttribute("x1", px(best[0])); cx.setAttribute("x2", px(best[0]));
+    tip.style.display = "block";
+    tip.style.left = (e.clientX + 12) + "px"; tip.style.top = (e.clientY - 28) + "px";
+    tip.textContent = `${best[1].toLocaleString()} ${unit || ""} · ${new Date(best[0] * 1000).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit" })}`;
+  });
+  svg.addEventListener("mouseleave", () => { tip.style.display = "none"; cx.style.display = "none"; });
+  if (floor) {
+    const wrap = document.createDocumentFragment();
+    wrap.append(svg);
+    wrap.append(el(`<div class="sub" style="margin-top:-2px"><span style="color:var(--bad)">--</span> floor ${floor.toLocaleString()} ${esc(unit || "")}</div>`));
+    return wrap;
+  }
+  return svg;
 }
 
 function card(title, extra = "") {
@@ -222,137 +285,195 @@ function card(title, extra = "") {
   return { card: c, body: c.querySelector(".body") };
 }
 
-/* ---------- pipeline health (from status.json) --------------------------- */
-function renderHealth() {
-  const host = document.getElementById("health");
-  host.innerHTML = "";
-  const s = STATUS;
-  if (!s) { host.append(el(`<div class="card"><div class="err">status.json unavailable - is tools/dashboard status running?</div></div>`)); return; }
-  const problems = [];
+/* ---------- pipeline health (from status.json) ---------------------------
+   PROGRESSIVE DISCLOSURE, not thirteen equal panels.
 
-  /* memory: the counter that matters here is MemFree as well as MemAvailable,
-     because available counts page cache as if it were already yours. */
-  {
-    const m = s.mem, t = s.trend || {};
-    const bad = m.avail_mb < m.floor_avail_mb, warn = m.free_mb < m.floor_free_mb;
-    if (bad) problems.push("memory at the floor");
-    else if (warn) problems.push("free memory low");
-    const { card: c, body } = card("host memory");
-    body.append(el(`<div class="big" style="color:${bad ? "var(--bad)" : warn ? "var(--warn)" : "var(--ok)"}">
-        ${m.avail_mb} MB <span style="font-size:12px;color:var(--dim)">available</span></div>
-      <div class="sub">${m.free_mb} MB free (floor ${m.floor_free_mb}) &middot; swap ${m.swap_pct}% &middot; floor ${m.floor_avail_mb} MB</div>`));
-    body.append(sparkline((t.samples || []).map(x => [x[0], x[1]]), m.floor_avail_mb));
-    const eta = [];
-    if (t.avail_eta_min >= 0) eta.push(`available reaches its floor in ~${t.avail_eta_min}m`);
-    if (t.free_eta_min >= 0) eta.push(`free in ~${t.free_eta_min}m`);
-    body.append(el(`<div class="sub">${eta.length ? "projected: " + esc(eta.join(", ")) : "not falling"}</div>`));
-    /* Raise this only inside the SAME lead window tools/watchdog uses. Flagging
-       any downward slope at all meant the header read "memory falling" with the
-       floor two hours away and plenty of headroom - permanently amber, which
-       teaches you to ignore the one time it matters. The projection stays
-       visible on the card either way; only the verdict is gated. */
-    const lead = STATUS.config?.mem_lead_mins ?? 30;
+   The first version gave a healthy subsystem exactly as much space, colour and
+   visual weight as a broken one, so a dead watcher thread sat in the same
+   grid as five cards saying "fine" and nothing stood out. Everything shouting
+   equally is the same as nothing shouting.
+
+   So each subsystem computes a state and a one-line summary. Healthy ones
+   collapse to a KPI tile; only the ones in warn/bad expand into a full card,
+   and the banner states the worst of them in a sentence. On a good day the
+   whole health section is one row - which is the point. Clicking any tile
+   expands it anyway, so nothing is hidden, only de-emphasised. */
+const STATE_RANK = { ok: 0, warn: 1, bad: 2 };
+let FORCE_OPEN = {};
+
+function statusEl(state, word) { return `<span class="st ${state}">${esc(word)}</span>`; }
+
+/* Each entry returns: state, a headline value, a one-line reason, and a
+   detail() that builds the full card only when it is actually needed. */
+function healthItems() {
+  const s = STATUS, out = [];
+  if (!s) return out;
+
+  { /* memory */
+    const m = s.mem, t = s.trend || {}, lead = s.config?.mem_lead_mins ?? 30;
     const soon = [t.avail_eta_min, t.free_eta_min].filter(v => v >= 0 && v <= lead);
-    if (soon.length) problems.push(`memory reaches its floor in ~${Math.min(...soon)}m`);
-    host.append(c);
+    const state = m.avail_mb < m.floor_avail_mb ? "bad"
+                : (m.free_mb < m.floor_free_mb || soon.length) ? "warn" : "ok";
+    const why = m.avail_mb < m.floor_avail_mb ? "at the floor - this is what corrupts an index"
+              : m.free_mb < m.floor_free_mb ? `only ${m.free_mb} MB free; reclaim is off a slow filesystem`
+              : soon.length ? `reaches its floor in ~${Math.min(...soon)}m at the current slope`
+              : "not falling";
+    out.push({ key: "memory", label: "host memory", state, why,
+      value: `${(m.avail_mb / 1024).toFixed(1)} GB`, unit: "available",
+      detail: () => {
+        const d = document.createDocumentFragment();
+        d.append(el(`<div class="sub">${m.free_mb} MB free (floor ${m.floor_free_mb}) &middot; swap ${m.swap_pct}% &middot; available floor ${m.floor_avail_mb} MB</div>`));
+        d.append(sparkline((t.samples || []).map(x => [x[0], x[1]]), m.floor_avail_mb, "MB available"));
+        d.append(el(`<div class="sub">${esc(why)}</div>`));
+        const c = s.consumers || [];
+        if (c.length) {
+          /* Emphasis, not a rainbow: the largest consumer is the story, the
+             rest are context. One accent hue, everything else recessive. */
+          d.append(el(`<div class="sub" style="margin-top:6px">largest consumers</div>`));
+          d.append(table([{ key: "n", label: "container" }, { key: "m", label: "MB", num: true }],
+            c.slice(0, 5).map((x, i) => ({ n: x.name, m: x.mb.toLocaleString(), bar: i === 0 ? x.mb : null }))));
+        }
+        return d;
+      } });
   }
 
-  /* watchers: a thread below the learned healthy peak is the stall signature. */
-  {
-    const { card: c, body } = card("watcher threads");
-    const rows = (s.watchers || []).map(w => ({
-      role: w.role,
-      th: `${w.threads}${w.peak ? " / " + w.peak : ""}`,
-      up: dur(w.age_sec),
-      st: w.degraded ? `<span class="flag bad"></span>thread lost`
-        : w.age_sec < 120 ? `<span class="flag warn"></span>starting`
-        : `<span class="flag ok"></span>ok`,
-    }));
-    (s.watchers || []).forEach(w => { if (w.degraded) problems.push(w.role + " lost a thread"); });
-    body.append(table(
-      [{ key: "role", label: "watcher" }, { key: "th", label: "threads", num: true },
-       { key: "up", label: "uptime", num: true }, { key: "st", label: "state", raw: true }], rows));
-    body.append(el(`<div class="sub">peak is learned only from a watcher that is draining</div>`));
-    host.append(c);
+  { /* watchers */
+    const w = s.watchers || [], down = w.filter(x => x.degraded);
+    const state = down.length ? "bad" : w.some(x => x.age_sec < 120) ? "warn" : "ok";
+    out.push({ key: "watchers", label: "watchers", state,
+      value: `${w.length - down.length}/${w.length}`, unit: "healthy",
+      why: down.length ? `${down.map(x => x.role).join(", ")} lost a thread - the queue stops draining`
+         : w.some(x => x.age_sec < 120) ? "a watcher is still starting" : "all threads present",
+      detail: () => table(
+        [{ key: "role", label: "watcher" }, { key: "th", label: "threads", num: true },
+         { key: "up", label: "uptime", num: true }, { key: "st", label: "state", raw: true }],
+        w.map(x => ({ role: x.role, th: `${x.threads}${x.peak ? " / " + x.peak : ""}`, up: dur(x.age_sec),
+          st: statusEl(x.degraded ? "bad" : x.age_sec < 120 ? "warn" : "ok",
+                       x.degraded ? "thread lost" : x.age_sec < 120 ? "starting" : "ok") }))) });
   }
 
-  /* queues: depth AND head age - a deep queue that moves is fine. */
-  {
-    const { card: c, body } = card("spool queues");
-    const rows = (s.queues || []).map(q => ({
-      name: q.name, pending: q.pending,
-      age: q.head_age_sec >= 0 ? dur(q.head_age_sec) : "-",
-      st: q.pending === 0 ? `<span class="flag ok"></span>empty`
-        : q.head_age_sec > 900 ? `<span class="flag warn"></span>head is old`
-        : `<span class="flag ok"></span>moving`,
-    }));
-    (s.queues || []).forEach(q => { if (q.name === "quarantine" && q.pending > 0) problems.push("captures in quarantine"); });
-    body.append(table([{ key: "name", label: "queue" }, { key: "pending", label: "pending", num: true },
-                       { key: "age", label: "head age", num: true }, { key: "st", label: "state", raw: true }], rows));
-    host.append(c);
+  { /* queues */
+    const q = s.queues || [];
+    const quar = q.find(x => x.name === "quarantine");
+    const old = q.filter(x => x.pending > 0 && x.head_age_sec > 900);
+    const state = (quar && quar.pending > 0) ? "warn" : old.length ? "warn" : "ok";
+    out.push({ key: "queues", label: "spool queues", state,
+      value: q.reduce((a, x) => a + x.pending, 0), unit: "pending",
+      why: (quar && quar.pending > 0) ? `${quar.pending} capture(s) in quarantine - unanalysed`
+         : old.length ? `${old[0].name} head is ${dur(old[0].head_age_sec)} old` : "everything draining",
+      detail: () => table(
+        [{ key: "name", label: "queue" }, { key: "p", label: "pending", num: true },
+         { key: "age", label: "head age", num: true }, { key: "st", label: "state", raw: true }],
+        q.map(x => ({ name: x.name, p: x.pending, age: x.head_age_sec >= 0 ? dur(x.head_age_sec) : "-",
+          st: statusEl(x.pending === 0 ? "ok" : x.head_age_sec > 900 ? "warn" : "ok",
+                       x.pending === 0 ? "empty" : x.head_age_sec > 900 ? "head is old" : "moving") }))) });
   }
 
-  /* the 9p mount against the settle window - late by construction above it. */
-  {
-    const f = s.fs || {}, { card: c, body } = card("filesystem latency");
-    if (!f.available) body.append(el(`<div class="empty">stall probe not running - tools/stall-probe start</div>`));
-    else {
-      const over = f.listdir_p95_ms > f.settle_sec * 1000;
-      if (over) problems.push("directory scans exceed the settle window");
-      body.append(el(`<div class="big" style="color:${over ? "var(--warn)" : "var(--ok)"}">${f.listdir_p95_ms} ms
-          <span style="font-size:12px;color:var(--dim)">p95 scan</span></div>
+  { /* filesystem */
+    const f = s.fs || {};
+    const state = !f.available ? "warn"
+                : f.projected_p95_s > f.settle_sec ? "warn"
+                : f.listdir_p95_ms > f.settle_sec * 1000 ? "warn" : "ok";
+    out.push({ key: "fs", label: "scan latency", state,
+      value: f.available ? `${(f.listdir_p95_ms / 1000).toFixed(1)}s` : "-", unit: "p95 directory scan",
+      why: !f.available ? "stall probe not running - tools/stall-probe start"
+         : f.projected_p95_s > f.settle_sec
+           ? `projects to ${f.projected_p95_s}s at full retention, past the ${f.settle_sec}s settle window`
+           : `inside the ${f.settle_sec}s settle window`,
+      detail: () => el(`<div>
         <div class="sub">p50 ${f.listdir_p50_ms} ms &middot; max ${f.listdir_max_ms} ms &middot; ${f.entries} entries</div>
-        <div class="sub">settle window ${f.settle_sec}s &middot; ${f.over_settle}/${f.samples} scans exceeded it</div>
+        <div class="sub">${f.over_settle}/${f.samples} scans exceeded the ${f.settle_sec}s settle window</div>
         <div class="sub">at the ${f.retain_files}-file retention steady state, p95 projects to
-          <b style="color:${f.projected_p95_s > f.settle_sec ? "var(--warn)" : "var(--ok)"}">${f.projected_p95_s}s</b></div>`));
-    }
-    host.append(c);
+          <b class="${f.projected_p95_s > f.settle_sec ? "st warn" : "st ok"}">${f.projected_p95_s}s</b></div>
+        <div class="sub">Past the settle window the watcher is late by construction, and that
+          presents exactly like a silent stall.</div></div>`) });
   }
 
-  /* cluster + snapshots: "can I lose data, and could I get it back" */
-  {
-    const cl = s.cluster || {}, sn = s.snapshots || {}, { card: c, body } = card("index & recovery");
-    if (!cl.reachable) { body.append(el(`<div class="err">cluster unreachable</div>`)); problems.push("cluster unreachable"); }
-    else {
-      if (cl.status !== "green") problems.push("cluster " + cl.status);
-      body.append(el(`<div class="kv"><span>cluster</span><b style="color:${
-        cl.status === "green" ? "var(--ok)" : cl.status === "yellow" ? "var(--warn)" : "var(--bad)"}">${esc(cl.status)}</b></div>
-        <div class="kv"><span>unassigned shards</span><b>${cl.unassigned}</b></div>
-        <div class="kv"><span>documents</span><b>${cl.docs.toLocaleString()}</b></div>
-        <div class="kv"><span>index size</span><b>${cl.size_gb} GB</b></div>`));
-    }
-    if (sn.available) {
-      const stale = sn.latest_age_sec > 172800;
-      if (stale || !sn.successful) problems.push("snapshots stale");
-      body.append(el(`<div class="kv" style="margin-top:6px;border-top:1px solid var(--line);padding-top:6px">
-          <span>snapshots</span><b>${sn.successful}</b></div>
-        <div class="kv"><span>newest</span><b class="${stale ? "stale" : ""}">${dur(sn.latest_age_sec)} ago</b></div>
-        <div class="sub">prove it restores: <code>tools/snapshot verify</code></div>`));
-    } else body.append(el(`<div class="sub">no snapshot repository - <code>tools/snapshot init</code></div>`));
-    host.append(c);
+  { /* index + snapshots */
+    const cl = s.cluster || {}, sn = s.snapshots || {};
+    const stale = sn.available && sn.latest_age_sec > 172800;
+    const state = !cl.reachable ? "bad" : cl.status === "red" ? "bad"
+                : (cl.status !== "green" || stale || !sn.available) ? "warn" : "ok";
+    out.push({ key: "index", label: "index & recovery", state,
+      value: cl.reachable ? (cl.docs || 0).toLocaleString() : "-", unit: "documents",
+      why: !cl.reachable ? "cluster unreachable"
+         : cl.status !== "green" ? `cluster ${cl.status}, ${cl.unassigned} shard(s) unassigned`
+         : !sn.available ? "no snapshot repository - tools/snapshot init"
+         : stale ? `newest snapshot is ${dur(sn.latest_age_sec)} old`
+         : `green, newest snapshot ${dur(sn.latest_age_sec)} old`,
+      detail: () => el(`<div>
+        <div class="kv"><span>cluster</span>${statusEl(cl.status === "green" ? "ok" : cl.status === "red" ? "bad" : "warn", cl.status || "unreachable")}</div>
+        <div class="kv"><span>unassigned shards</span><b>${cl.unassigned ?? "-"}</b></div>
+        <div class="kv"><span>index size</span><b>${cl.size_gb ?? "-"} GB</b></div>
+        <div class="kv"><span>snapshots</span><b>${sn.successful ?? 0}</b></div>
+        <div class="kv"><span>newest</span><b>${dur(sn.latest_age_sec)} ago</b></div>
+        <div class="sub">A corrupted index cannot be repaired, only restored.
+          Prove it works: <code>tools/snapshot verify</code></div></div>`) });
   }
 
-  /* incident history - every forensics dump the watchdog took before repairing */
-  {
-    const inc = s.incidents || [], { card: c, body } = card("stalls healed", `<span class="tag">${inc.length}</span>`);
-    if (!inc.length) body.append(el(`<div class="empty">no stalls recorded</div>`));
-    else {
-      const byLabel = {};
-      inc.forEach(i => { const k = i.label.replace(/^(thread-lost|queue-wedged)-/, "$1 "); byLabel[k] = (byLabel[k] || 0) + 1; });
-      const now = Date.now() / 1000;
-      body.append(table([{ key: "k", label: "kind" }, { key: "n", label: "count", num: true }],
-        Object.entries(byLabel).sort((a, b) => b[1] - a[1]).map(([k, n]) => ({ k, n, bar: n }))));
-      const last = inc[inc.length - 1];
-      body.append(el(`<div class="sub">most recent ${dur(Math.round(now - last.t))} ago &middot; ${esc(last.label)}</div>
-        <div class="sub">dumps in <code>${esc("$STATE_DIR/forensics")}</code></div>`));
-    }
-    host.append(c);
+  { /* incidents */
+    const inc = s.incidents || [];
+    const now = Date.now() / 1000;
+    const recent = inc.filter(i => now - i.t < 3600).length;
+    out.push({ key: "stalls", label: "stalls healed", state: recent > 3 ? "warn" : "ok",
+      value: inc.length, unit: recent ? `${recent} in the last hour` : "all time",
+      why: recent > 3 ? `${recent} in the last hour - well above the usual rate`
+         : inc.length ? `most recent ${dur(Math.round(now - inc[inc.length - 1].t))} ago` : "none recorded",
+      detail: () => {
+        const by = {};
+        inc.forEach(i => { const k = i.label.replace(/^(thread-lost|queue-wedged)-/, "$1 "); by[k] = (by[k] || 0) + 1; });
+        const d = document.createDocumentFragment();
+        d.append(table([{ key: "k", label: "kind" }, { key: "n", label: "count", num: true }],
+          Object.entries(by).sort((x, y) => y[1] - x[1]).map(([k, n]) => ({ k, n, bar: n }))));
+        d.append(el(`<div class="sub">each one is a forensics dump taken before the repair, in <code>$STATE_DIR/forensics</code></div>`));
+        return d;
+      } });
+  }
+  return out;
+}
+
+function renderHealth() {
+  const kpi = document.getElementById("kpi"), host = document.getElementById("health");
+  const banner = document.getElementById("banner");
+  kpi.innerHTML = ""; host.innerHTML = "";
+
+  if (!STATUS) {
+    banner.innerHTML = `<span class="hero st bad">status feed unavailable</span>
+      <span class="why">is <code>tools/dashboard status</code> running?</span>`;
+    return;
   }
 
+  const items = healthItems();
+  const worst = items.reduce((a, i) => Math.max(a, STATE_RANK[i.state]), 0);
+  const bad = items.filter(i => i.state !== "ok").sort((a, b) => STATE_RANK[b.state] - STATE_RANK[a.state]);
+
+  /* One sentence, worst first. Not a count of panels - what is wrong and why. */
+  banner.innerHTML = bad.length
+    ? `<span class="hero st ${bad[0].state}">${esc(bad[0].label)}: ${esc(bad[0].why)}</span>` +
+      (bad.length > 1 ? `<span class="why">and ${bad.length - 1} other${bad.length > 2 ? "s" : ""}: ${
+        esc(bad.slice(1).map(i => i.label).join(", "))}</span>` : "")
+    : `<span class="hero st ok">pipeline healthy</span><span class="why">${
+        esc(items.map(i => i.label + " " + String(i.value) + " " + i.unit).slice(0, 3).join(" &middot; ").replace(/&middot;/g, "·"))}</span>`;
+
+  for (const it of items) {
+    const t = el(`<div class="kpi ${it.state === "bad" ? "critical" : it.state === "warn" ? "problem" : ""}">
+      <div class="k">${esc(it.label)}</div>
+      <div class="v">${esc(String(it.value))} <span class="muted" style="font-size:11px;font-weight:400">${esc(it.unit)}</span></div>
+      <div class="s">${statusEl(it.state, it.state === "ok" ? "ok" : it.why.length > 44 ? it.why.slice(0, 42) + "…" : it.why)}</div>
+    </div>`);
+    t.title = it.why;
+    t.onclick = () => { FORCE_OPEN[it.key] = !FORCE_OPEN[it.key]; renderHealth(); };
+    kpi.append(t);
+
+    if (it.state !== "ok" || FORCE_OPEN[it.key]) {
+      const { card: c, body } = card(it.label, `  ${statusEl(it.state, it.state)}`);
+      body.append(it.detail());
+      host.append(c);
+    }
+  }
   const v = document.getElementById("verdict");
-  v.className = "pill " + (problems.some(p => /floor|unreachable|red|lost/.test(p)) ? "bad" : problems.length ? "warn" : "ok");
-  v.textContent = problems.length ? problems[0] + (problems.length > 1 ? ` +${problems.length - 1}` : "") : "healthy";
-  v.title = problems.join("\n") || "no problems detected";
+  v.className = "pill " + (worst === 2 ? "bad" : worst === 1 ? "warn" : "ok");
+  v.textContent = bad.length ? `${bad.length} to look at` : "healthy";
 }
 
 /* ---------- network (live queries) --------------------------------------- */
@@ -472,17 +593,26 @@ function renderNetwork() {
   const host = document.getElementById("network");
   host.innerHTML = "";
 
-  /* These two go first because they are the question a human actually asks:
-     which of my devices is talking to what, right now. */
+  /* "Now" is its own section, above the analysis tables, because it is the
+     question a person actually arrives with: which of my devices is talking to
+     what, at this moment. The aggregate tables answer a different and slower
+     question and can wait below it. */
+  const now = document.getElementById("now");
+  now.innerHTML = "";
   const feed = card("live activity");
   feed.body.id = "feed-body"; feed.body.innerHTML = `<div class="muted">loading…</div>`;
   feed.card.style.gridColumn = "span 2";
-  host.append(feed.card);
+  /* Bounded and scrolled, not unbounded. Fifty rows of feed pushed the analysis
+     section a screen and a half down the page - the most recent line is the
+     valuable one, so keep the card a fixed size and let it scroll internally. */
+  feed.body.style.maxHeight = "420px";
+  feed.body.style.overflowY = "auto";
+  now.append(feed.card);
 
   const dev = card("devices");
   dev.body.id = "devices-body"; dev.body.innerHTML = `<div class="muted">loading…</div>`;
   dev.card.style.gridColumn = "span 2";
-  host.append(dev.card);
+  now.append(dev.card);
 
   renderActivity();
   const mk = (title, note, fn) => {

@@ -317,6 +317,45 @@ and the service names from the ssl records, in one query. For a per-connection
 feed, do not show bytes at all; show the destination address and port, which are
 actually present on that record.
 
+### A dashboard where everything is equally loud says nothing
+
+The first console put thirteen panels in two undifferentiated grids at identical
+size and weight. A dead watcher thread occupied exactly as much of the screen as
+five cards reading "fine", so the eye had nowhere to go. Adding panels makes this
+worse, not better.
+
+What fixed it was subtraction:
+
+- **One hero line** stating the worst thing in a sentence - what is wrong and
+  why - rather than a small coloured pill.
+- **Progressive disclosure.** Each subsystem computes a state; healthy ones
+  collapse to a KPI tile, and only warn/bad expand into a full card. On a good
+  day the entire health section is one row. Nothing is hidden - clicking a tile
+  expands it - only de-emphasised.
+- **Emphasis over enumeration.** In the consumers table only the largest bar is
+  drawn; the rest are context. The single most underused form.
+- **Sections** (`now` / `analysis`) so the page has an order, with the live feed
+  above the aggregate tables because that is the question people arrive with.
+- **Bounded panels.** A 50-row feed pushed everything else a screen and a half
+  down; it is now fixed-height and scrolls internally.
+
+### Status colour needs a glyph, and the check is computable
+
+Run the numbers rather than trusting the swatches. Measured on this console's
+palette against its own dark surface:
+
+```
+adjacent pair  #d29922 (warn) <-> #3fb950 (ok)   deltaE 5.1 (protan)
+```
+
+Amber against green is close to indistinguishable for a red-blind reader. That is
+permissible **only** with secondary encoding, so every status here carries a glyph
+and a word (`● ok`, `▲ warn`, `✕ thread lost`) and never colour alone - including
+the coloured headline numbers, which now sit beside an explicit state word.
+
+The same rule caught the sparkline's floor line: a dashed red line with no label
+requires the reader to guess what it marks. It is labelled now.
+
 ### A failed query must not look like an empty result
 
 The recurring lesson of this whole deployment, and it applies hardest to a UI:
