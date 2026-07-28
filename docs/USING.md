@@ -350,3 +350,39 @@ tools/osapi ppl 'source=mitm-flows-* | stats count() by `mitm.redacted`'
 ```
 
 Treat the index as sensitive either way — it contains decrypted payloads.
+
+## Hunting
+
+`tools/investigate` includes a hunt section: non-standard destination ports, and
+external destinations reached with no SNI and no preceding DNS lookup.
+
+Both are *identification* prompts, not alarms. On a real network the odd-port
+list is dominated by games, VPNs and P2P, and the no-DNS list by mesh VPN relays
+that dial IPs from a baked-in map. The work is naming each one, not reacting to
+it.
+
+**Never attribute by GeoIP or ASN from this data.** The bundled database is stale
+enough to place Hetzner ranges in Iran, which manufactures alarming findings out
+of nothing. Confirm with RDAP:
+
+```sh
+curl -s https://rdap.db.ripe.net/ip/<ip>  | jq '{name,country}'
+curl -s https://rdap.arin.net/registry/ip/<ip> | jq '{name}'
+```
+
+**Correlation by time window is the cheapest way to name an unknown flow.** An
+unexplained UDP session peaking 20:30-22:00 and stopping at midnight, alongside
+a game's TLS API peaking in the same window, is that game's traffic. Check what
+else the host was doing:
+
+```sh
+tools/osapi es POST 'arkime_sessions3-*/_search' '{"size":0,
+  "query":{"bool":{"filter":[{"term":{"event.dataset":"ssl"}},
+    {"range":{"@timestamp":{"gte":"<start>","lt":"<end>"}}}]}},
+  "aggs":{"d":{"terms":{"field":"server.domain","size":10}}}}'
+```
+
+Signals that turned out to be worth nothing here, so you can skip them: rare
+destinations (632 external, 217 seen twice or less — all CDN churn), and most
+Suricata INFO rules. Signals worth keeping: upload asymmetry, and any port that
+is not 80/443/53.

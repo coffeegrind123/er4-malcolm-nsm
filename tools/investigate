@@ -202,6 +202,56 @@ if ca.get("iss", {}).get("buckets"):
         print(f"  {ll['doc_count']} certs valid past 2030 ({who}) — private CAs only; "
               f"public CAs are capped near 398 days")
 
+head("Hunt — things that warrant a second look")
+# Three cheap signals that catch most of what matters on a small network, and
+# one caveat that matters more than the signals.
+#
+# CAVEAT: do not attribute anything by GeoIP or ASN from this data. The bundled
+# database is stale enough to place Hetzner ranges in Iran. Confirm ownership
+# with RDAP before acting on a destination:
+#   curl -s https://rdap.db.ripe.net/ip/<ip> | jq '{name,country}'
+hunt = search({
+    "size": 0,
+    "query": {"bool": {"filter": [{"term": {"event.dataset": "conn"}},
+                                  {"range": {"@timestamp": {"gte": since}}}]}},
+    "aggs": {
+        # Ports outside the everyday set. Real finds hide here; so does every
+        # game, VPN and P2P client, so expect to identify rather than alarm.
+        "oddport": {"filter": {"bool": {"must_not": [{"terms": {"destination.port": [
+            80, 443, 53, 123, 5353, 1900, 5355, 137, 138, 139, 67, 68, 547, 0, 1, 3, 8, 11]}}]}},
+            "aggs": {"p": {"terms": {"field": "destination.port", "size": 10},
+                           "aggs": {"d": {"terms": {"field": "destination.ip", "size": 1}},
+                                    "s": {"terms": {"field": "source.ip", "size": 1}}}}}},
+        # A destination reached without any preceding DNS lookup is either a
+        # hardcoded address or a resolution that happened before capture began.
+        # Mesh VPNs do this legitimately; so does malware with a baked-in C2.
+        "nodns": {"terms": {"field": "destination.ip", "size": 25},
+                  "aggs": {"sni": {"terms": {"field": "server.domain", "size": 1}}}},
+    },
+})
+h = hunt.get("aggregations", {})
+print("  non-standard destination ports:")
+for b in h.get("oddport", {}).get("p", {}).get("buckets", [])[:10]:
+    d = b["d"]["buckets"][0]["key"] if b["d"]["buckets"] else "?"
+    src = b["s"]["buckets"][0]["key"] if b["s"]["buckets"] else "?"
+    print(f"    :{str(b['key']):<7s} n={b['doc_count']:<6d} {src} -> {d}")
+
+print("  external destinations with no SNI and no DNS (verify with RDAP):")
+shown = 0
+for b in h.get("nodns", {}).get("buckets", []):
+    sni = b["sni"]["buckets"][0]["key"] if b["sni"]["buckets"] else "-"
+    if sni != "-":
+        continue
+    ip = str(b["key"])
+    if ip.startswith(("192.168.", "10.", "172.1", "172.2", "172.3", "224.", "239.", "255.", "fe80", "ff02")):
+        continue
+    print(f"    {ip:<18s} n={b['doc_count']}")
+    shown += 1
+    if shown >= 6:
+        break
+if not shown:
+    print("    none")
+
 head("DNS health")
 # Two questions worth asking of DNS, and neither is "what did we look up".
 #
