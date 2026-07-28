@@ -273,6 +273,34 @@ healthy — is invisible to `docker compose ps`, and costs you every packet
 captured until someone notices the graphs are flat. See
 [GOTCHAS.md](GOTCHAS.md).
 
+### `MEMORY LOW` / `SWAP PRESSURE`
+
+Act on these before anything else, and **do not restart your way out of them**.
+
+OpenSearch reports an out-of-memory host as a **corrupt index**: a flush cannot
+read its segment infos, Lucene raises `CorruptIndexException`, the shard becomes
+unassignable and that data is gone for good. The innermost cause in the log is
+`Cannot allocate memory`, several `nested:` clauses down, so the top of the stack
+trace blames the disk. It happened here at 143 MB available with 13.5 GB of 16 GB
+swap in use, and the first symptom of any kind was a red cluster.
+
+```sh
+free -m
+ps -eo rss,pid,etimes,comm --sort=-rss | head
+docker stats --no-stream --format '{{.MemUsage}}\t{{.Name}}'
+```
+
+The stack is not usually the culprit — OpenSearch and Logstash are sized
+deliberately (see `OPENSEARCH_HEAP`). Look for whatever else shares the host.
+Reclaim what is safe (`sync; echo 3 > /proc/sys/vm/drop_caches` in a privileged
+container recovers page cache immediately), and **wait for a heavy job to finish
+rather than restarting OpenSearch under pressure** — a restart needs memory it
+does not have.
+
+Recovering a shard lost this way is in [GOTCHAS.md](GOTCHAS.md); the short
+version is that you cannot, and that retrying the allocation while the host is
+still short burns the five-attempt budget in seconds.
+
 ### Quarantined captures
 
 A single oversized capture deadlocks the mover and stops the whole pipeline, so

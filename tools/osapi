@@ -21,6 +21,9 @@
 #            executed inside the opensearch container where that cert lives.
 set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Load config.env (explicit environment still wins). Without this the container
+# name below is derived from a default MALCOLM_DIR and misses a relocated install.
+. "${HERE}/_config.sh"
 
 BASE="${MALCOLM_BASE:-https://host.docker.internal}"
 USER_="${MALCOLM_USER:-admin}"

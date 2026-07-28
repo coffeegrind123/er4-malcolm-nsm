@@ -24,6 +24,10 @@
 set -uo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 OSAPI="${HERE}/osapi"
+# Reads config.env without clobbering an explicit `VAR=x tools/watchdog`.
+# Without this the paths below ignored DATA_ROOT entirely: relocate the data and
+# the watchdog keeps checking the old directory and calls it healthy.
+. "${HERE}/_config.sh"
 
 MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
 PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
@@ -41,8 +45,34 @@ STATE_DIR="${STATE_DIR:-${TMPDIR:-/tmp}/er4-watchdog}"
 mkdir -p "$STATE_DIR"
 HEAL=0; [[ "${1:-}" == "--heal" ]] && HEAL=1
 
+# Warn before memory pressure corrupts an index, not after.
+#
+# OpenSearch reports an out-of-memory host as a CORRUPT INDEX: a flush fails to
+# read its segment infos, and Lucene raises CorruptIndexException whose innermost
+# cause is "Cannot allocate memory". The shard is then unassignable and the data
+# is gone. That happened here to arkime_stats at 143 MB free with 13.5 GB of
+# 16 GB swap in use, and the first warning of any kind was a red cluster.
+#
+# It is worth warning early because the loss is not recoverable and the next
+# index to be hit may be a session index rather than a stats one.
+MEM_WARN_MB="${MEM_WARN_MB:-2048}"       # available memory below this is dangerous
+SWAP_WARN_PCT="${SWAP_WARN_PCT:-85}"     # swap this full means the host is already thrashing
 problems=0
 report() { echo "$*"; problems=$((problems + 1)); }
+
+if [[ -r /proc/meminfo ]]; then
+  mem_avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+  swap_total=$(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo)
+  swap_free=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)
+  swap_pct=0
+  [[ "${swap_total:-0}" -gt 0 ]] && swap_pct=$(( (swap_total - swap_free) * 100 / swap_total ))
+
+  if [[ "${mem_avail:-99999}" -lt "$MEM_WARN_MB" ]]; then
+    report "MEMORY LOW (${mem_avail}MB available, swap ${swap_pct}% used) - OpenSearch reports this as index corruption, not as an OOM"
+  elif [[ "${swap_pct:-0}" -ge "$SWAP_WARN_PCT" ]]; then
+    report "SWAP PRESSURE (${swap_pct}% of swap in use, ${mem_avail}MB available) - a flush failing here corrupts a shard irrecoverably"
+  fi
+fi
 
 # Cluster health, with transient recovery separated from actual degradation.
 #
