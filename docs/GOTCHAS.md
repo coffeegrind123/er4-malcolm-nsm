@@ -1001,6 +1001,24 @@ When correlating an event with an activity log, check that the activity is
 *after* the event, not merely near it. "Is it working now?" needs a timestamp
 comparison, not a glance.
 
+**9p blocking is a confounder, not the cause.** Every forensics dump - stalled or
+healthy - shows the *publisher* thread in `state=D wchan=p9_client_rpc` on a
+`newfstatat`. That is its normal job: it stats files on the Windows bind mount
+continuously. So "a watcher thread is blocked in 9p" is true at almost any
+instant you look, which is precisely why it survived so long as the leading
+hypothesis without ever being tested. Attribute the blocked thread to a ROLE
+before drawing a conclusion from it; a `grep -c p9_client_rpc` over a whole dump
+answers a different question than the one being asked.
+
+**Suspected link to memory pressure, not yet established.** Four thread deaths
+across two containers inside ~50 minutes, all of them after the host hit the
+out-of-memory threshold and lost a shard - against a background rate of roughly
+one stall every 2-4 hours. A thread dying with no logged exception is consistent
+with an allocation failure inside it, the same `Cannot allocate memory` that
+Lucene reports as corruption. Test before believing it: compare thread-death
+timestamps against the `tools/memguard` sample history over several days, and see
+whether the rate falls once the OpenSearch heap is right-sized.
+
 **Detection.** Thread loss is visible within one poll; the queue-age rule took
 5.5 minutes to fire. `tools/watchdog` now checks both together - a thread count
 below the maximum observed for that process AND no drain events - because either
