@@ -54,6 +54,30 @@ b=datetime.datetime.fromtimestamp(m.build_epoch, datetime.timezone.utc)
 age=(datetime.datetime.now(datetime.timezone.utc)-b).days
 print(f\"    {m.database_type}  built {b:%Y-%m-%d}  ({age} days old)\")
 "' 2>/dev/null
+
+  # Report the CITY database too, and from its own metadata rather than its
+  # mtime. This tool only ever replaces the ASN half, and the question "did we
+  # update GeoIP?" has a different answer for each half - so reporting only the
+  # half that was updated invites the reasonable but wrong conclusion that
+  # country and city attribution are current. The city file's mtime is the IMAGE
+  # build date, which always looks recent; build_epoch is the truth.
+  say "City database in use by logstash (NOT updated by this tool)"
+  docker exec "${COMPOSE_PROJECT:-malcolm}-logstash-1" python3 -c '
+import datetime, glob
+g = glob.glob("/usr/share/logstash/vendor/bundle/jruby/*/gems/logstash-filter-geoip-*/vendor/GeoLite2-City.mmdb")
+if not g:
+    print("    no city database found"); raise SystemExit
+d = open(g[0], "rb").read()
+m = b"\xab\xcd\xefMaxMind.com"
+meta = d[d.rfind(m) + len(m):]
+k = meta.find(b"build_epoch") + len("build_epoch")
+size = meta[k] & 0x1f          # control byte 0x04 = extended type, real type in the next byte
+val = int.from_bytes(meta[k + 2:k + 2 + size], "big")
+b = datetime.datetime.fromtimestamp(val, datetime.timezone.utc)
+age = (datetime.datetime.now(datetime.timezone.utc) - b).days
+print(f"    GeoLite2-City  built {b:%Y-%m-%d}  ({age} days old)")
+print("    City and country attribution comes from this. Confirm with RDAP before acting on it.")
+' 2>/dev/null
   exit 0
 fi
 

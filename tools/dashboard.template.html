@@ -618,7 +618,9 @@ async function openDrill(field, value) {
     wrap.append(el(`<div class="sub" style="margin-top:12px">
       open in Arkime:
       <a target="_blank" href="/arkime/sessions?expression=${encodeURIComponent(field + " == " + value)}&date=-1">full sessions and packets</a>
-      &middot; GeoIP city data is years stale - confirm attribution with RDAP before acting on it
+      &middot; ASN/organisation is current (DB-IP, monthly); <b>city and country come from a
+      2019 database</b> and reallocated ranges resolve to their previous owners -
+      confirm with RDAP before acting on a location
     </div>`));
 
     body.innerHTML = ""; body.append(wrap);

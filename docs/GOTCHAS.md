@@ -615,7 +615,7 @@ tunnel and long-poll connection reads as malicious.
 
 ### The bundled GeoIP database is from 2019
 Not "a bit out of date" - `logstash-filter-geoip` vendors GeoLite2 databases
-built **2019-11-18**, because MaxMind's licence change that year stopped the
+built **2019-11-12** (read from the file's own `build_epoch`, not its mtime), because MaxMind's licence change that year stopped the
 plugin shipping refreshed copies. The file mtime shows the *image* build date
 and looks recent, which is how this hides.
 
