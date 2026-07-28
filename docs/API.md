@@ -85,15 +85,29 @@ tools/osapi ws create "Network Investigation" analytics
 ```
 
 **Retention** — full-packet indices grow until the disk does not. The bundled
-policy ages indices to read-only at 7d and deletes at 90d. It ships with **no
-`ism_template`, so it applies to nothing until you attach it** — deliberately,
-so nothing is deleted by surprise:
+policy ages indices to read-only at 7d and deletes at 90d.
 
 ```sh
 tools/osapi ism add malcolm-session-retention collector/ism-retention.json
-tools/osapi ism apply 'arkime_sessions3-*' malcolm-session-retention   # opt in
-tools/osapi ism status arkime_sessions3-260727
+tools/osapi es POST '_plugins/_ism/add/arkime_sessions3-260728' '{"policy_id":"malcolm-session-retention"}'
+tools/osapi es GET '_plugins/_ism/explain/arkime_sessions3-*'
 ```
+
+Three things that decide whether this actually works:
+
+- **Check `INDEX_MANAGEMENT_ENABLED` first.** If Malcolm's own index management
+  is on, adding this gives you two managers on the same indices. It ships
+  `false`, so ISM is the only manager, but verify rather than assume.
+- **The `ism_template` is what covers future indices.** Attaching a policy only
+  affects indices that exist right now. Without the template, tomorrow's daily
+  index is unmanaged and retention quietly stops working months later, which is
+  exactly when nobody is looking.
+- **The template pattern is `arkime_sessions3-2*`, not `-*`.** The wildcard also
+  matches `arkime_sessions3-initial`, an empty index Arkime keeps as a template.
+  Ageing that into a delete state is a surprise with no upside.
+
+`state=(not yet evaluated)` right after attaching is normal — ISM runs on a
+schedule (roughly every 30-48 minutes), it does not act on attach.
 
 **Users and roles:**
 
