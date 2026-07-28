@@ -324,6 +324,9 @@ def main():
             "rotate_secs": int(os.environ.get("ROTATE_SECS", 120)),
             "pcap_retention_days": int(os.environ.get("PCAP_RETENTION_DAYS", 7)),
             "max_pcap_mb": int(os.environ.get("MAX_PCAP_BYTES", 268435456)) // 1048576,
+            # The console must use the SAME lead time as the watchdog, or the two
+            # disagree about what counts as a problem and the page cries wolf.
+            "mem_lead_mins": int(os.environ.get("MEM_LEAD_MINS", 30)),
         },
         "mem": meminfo(),
         "trend": mem_trend(),

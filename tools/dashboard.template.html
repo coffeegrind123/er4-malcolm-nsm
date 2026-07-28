@@ -246,7 +246,14 @@ function renderHealth() {
     if (t.avail_eta_min >= 0) eta.push(`available reaches its floor in ~${t.avail_eta_min}m`);
     if (t.free_eta_min >= 0) eta.push(`free in ~${t.free_eta_min}m`);
     body.append(el(`<div class="sub">${eta.length ? "projected: " + esc(eta.join(", ")) : "not falling"}</div>`));
-    if (eta.length) problems.push("memory falling");
+    /* Raise this only inside the SAME lead window tools/watchdog uses. Flagging
+       any downward slope at all meant the header read "memory falling" with the
+       floor two hours away and plenty of headroom - permanently amber, which
+       teaches you to ignore the one time it matters. The projection stays
+       visible on the card either way; only the verdict is gated. */
+    const lead = STATUS.config?.mem_lead_mins ?? 30;
+    const soon = [t.avail_eta_min, t.free_eta_min].filter(v => v >= 0 && v <= lead);
+    if (soon.length) problems.push(`memory reaches its floor in ~${Math.min(...soon)}m`);
     host.append(c);
   }
 

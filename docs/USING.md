@@ -315,10 +315,20 @@ the packets.
 
 No new service runs for any of this. The page is static and served by Malcolm's
 own nginx, which makes it same-origin with the APIs, so the browser does the
-querying. Only `status.json` is written server-side, refreshed by every
-`tools/watchdog` run; for a faster cadence run `tools/dashboard watch 60`. The
-header always shows how old that data is, so a stopped refresher looks stale
-rather than quietly serving old numbers as current.
+querying. Only `status.json` is written server-side.
+
+**Keep the feed fresh.** Every `tools/watchdog` run rewrites it, so on a 5-minute
+watchdog timer the header will read up to `5m old`. For the 60-second cadence the
+page polls at, run the refresher alongside the watchdog:
+
+```sh
+nohup tools/dashboard watch 60 >/tmp/dashboard-watch.log 2>&1 &
+```
+
+It costs about two seconds of work per minute (the expensive parts are cached).
+The header always shows the AGE of the data, so a refresher that dies reads as
+stale rather than quietly serving old numbers as current — check there first if
+the numbers look frozen.
 
 ## Snapshots — the thing that makes an index loss survivable
 
