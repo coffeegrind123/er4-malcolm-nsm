@@ -119,6 +119,7 @@ pieces and queued — never discarded. See `config.env.example` and
 ### Keeping it alive
 
 ```sh
+tools/dashboard install  # one page for pipeline health + network, at https://<host>/nsm/
 tools/watchdog --heal    # detect and repair silent watcher stalls; run on a timer
 tools/memguard           # memory trend, largest consumers, mitigation ladder
 tools/snapshot verify    # prove the backups restore, rather than assuming it

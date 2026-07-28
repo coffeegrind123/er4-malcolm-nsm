@@ -1,0 +1,167 @@
+#!/usr/bin/env bash
+# Single-pane console for this deployment.
+#
+#   tools/dashboard install   bind-mount it into Malcolm's nginx, once
+#   tools/dashboard build     render the page (and refresh the status feed)
+#   tools/dashboard status    refresh the status feed only (cheap; the watchdog calls this)
+#   tools/dashboard watch     keep the status feed fresh on an interval
+#   tools/dashboard url       print where to open it
+#
+# WHY IT IS BUILT THIS WAY
+#
+# Malcolm already ships OpenSearch Dashboards and Arkime, and both answer "what
+# is on the network" better than anything written here would. What neither can
+# answer is "is the pipeline healthy", because the things that actually break on
+# this deployment do not exist in any index:
+#
+#   a watcher thread dies and its queue stops draining - containers stay healthy
+#   the host runs out of memory and OpenSearch calls it a corrupt index
+#   captures land in a directory nothing is polling
+#   a snapshot has never been proven to restore
+#
+# Every one of those happened while this repo was being written, and every one
+# was invisible in both shipped UIs.
+#
+# NO NEW SERVICE. The page is a static file served by Malcolm's OWN nginx, which
+# puts it same-origin with /mapi/, /arkime/ and the OpenSearch console proxy - so
+# the BROWSER runs the live queries and the drill-downs. That is the whole trick:
+# full interactivity with zero long-running processes on a host that has no
+# memory to spare for one. The only thing written server-side is status.json,
+# which holds the host facts no API exposes.
+#
+# WHAT IS COMMITTED. The template and these scripts - never the rendered page or
+# the status feed. Those are written to the data root, outside the repo, because
+# they contain real addresses and this repo is public.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/_config.sh"
+
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+NGINX_CONTAINER="${NGINX_CONTAINER:-${COMPOSE_PROJECT}-nginx-proxy-1}"
+# Host-side location of the rendered page. Lives with the data, not the repo.
+DASH_DIR_WIN="${DASHBOARD_DIR_WIN:-${DATA_ROOT_WIN:-//d/malcolm-data}/dashboard}"
+# Where nginx serves it from. A SUBDIRECTORY of the static root, so Malcolm's own
+# landing page is untouched and an upgrade cannot silently overwrite this.
+NGINX_PATH="${DASHBOARD_NGINX_PATH:-/usr/share/nginx/html/nsm}"
+REFRESH="${DASHBOARD_REFRESH_SECS:-60}"
+URL_BASE="${MALCOLM_BASE:-https://host.docker.internal}"
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+die()  { printf '    \033[31mfail\033[0m %s\n' "$*" >&2; exit 1; }
+
+indash() { docker run --rm -v "${DASH_DIR_WIN}:/d" alpine sh -c "$1" 2>/dev/null; }
+
+cmd_install() {
+  say "serving the console from Malcolm's nginx"
+
+  indash 'mkdir -p /d' || die "could not create ${DASH_DIR_WIN}"
+  ok "content directory: ${DASH_DIR_WIN}"
+
+  local compose="${MALCOLM_DIR}/docker-compose.yml"
+  [[ -f "$compose" ]] || die "no docker-compose.yml at ${compose}"
+
+  if grep -q "$NGINX_PATH" "$compose"; then
+    ok "compose already mounts the console"
+  else
+    # Insert the bind mount into the nginx-proxy service's volume list. Written
+    # in the same long form the rest of the file uses, with an absolute
+    # Windows-style source: a relative source under Docker Desktop resolves to a
+    # DIFFERENT, EMPTY view of the filesystem, and nginx would serve 404s from a
+    # directory that looks correct from the host (docs/GOTCHAS.md).
+    python3 - "$compose" "$DASH_DIR_WIN" "$NGINX_PATH" <<'PY' || die "could not patch docker-compose.yml"
+import re, shutil, sys
+path, src, dst = sys.argv[1], sys.argv[2], sys.argv[3]
+text = open(path).read()
+m = re.search(r'^(  nginx-proxy:\n)(.*?)(?=^  \S|\Z)', text, re.S | re.M)
+if not m:
+    sys.exit("nginx-proxy service not found")
+block = m.group(2)
+if dst in block:
+    sys.exit(0)
+vm = re.search(r'^(    volumes:\n)', block, re.M)
+if not vm:
+    sys.exit("nginx-proxy has no volumes: block")
+entry = (f"    - type: bind\n      bind:\n        create_host_path: false\n"
+         f"      source: {src}\n      target: {dst}\n      read_only: true\n")
+new_block = block[:vm.end()] + entry + block[vm.end():]
+shutil.copy(path, path + ".bak-dashboard")
+open(path, "w").write(text[:m.start(2)] + new_block + text[m.end(2):])
+print("patched")
+PY
+    ok "docker-compose.yml patched (backup: docker-compose.yml.bak-dashboard)"
+  fi
+
+  cmd_build
+
+  say "restarting nginx to pick up the mount"
+  (cd "$MALCOLM_DIR" && docker compose --profile malcolm up -d nginx-proxy >/dev/null 2>&1) \
+    || die "could not recreate nginx-proxy"
+
+  # Verify rather than assume: a bind mount that resolved to the wrong place
+  # produces a running container serving nothing, which looks like success.
+  local n=0
+  until docker exec "$NGINX_CONTAINER" test -f "${NGINX_PATH}/index.html" 2>/dev/null || [[ $n -ge 18 ]]; do
+    sleep 5; n=$((n + 1))
+  done
+  if docker exec "$NGINX_CONTAINER" test -f "${NGINX_PATH}/index.html" 2>/dev/null; then
+    ok "nginx can see the page inside the container"
+  else
+    die "nginx is running but ${NGINX_PATH}/index.html is not visible to it - check the bind source"
+  fi
+  cmd_url
+}
+
+cmd_build() {
+  local tpl="${HERE}/dashboard.template.html"
+  [[ -f "$tpl" ]] || die "missing ${tpl}"
+  # The template carries no data and needs no substitution - everything it shows
+  # is fetched at runtime. That is deliberate: it is what makes the committed
+  # file safe in a public repo.
+  docker run --rm -i -v "${DASH_DIR_WIN}:/d" alpine sh -c 'cat > /d/index.html' < "$tpl" \
+    || die "could not write index.html"
+  ok "page rendered to ${DASH_DIR_WIN}/index.html"
+  cmd_status
+}
+
+cmd_status() {
+  local tmp; tmp="$(mktemp -d)"
+  DASHBOARD_REFRESH_SECS="$REFRESH" python3 "${HERE}/dashboard-status.py" "${tmp}/status.json" >/dev/null 2>&1
+  if [[ -s "${tmp}/status.json" ]]; then
+    docker run --rm -i -v "${DASH_DIR_WIN}:/d" alpine sh -c 'cat > /d/status.json.tmp && mv /d/status.json.tmp /d/status.json' \
+      < "${tmp}/status.json" 2>/dev/null \
+      && ok "status feed refreshed ($(wc -c < "${tmp}/status.json") bytes)" \
+      || warn "could not write status.json"
+  else
+    warn "status collection produced nothing"
+  fi
+  rm -rf "$tmp"
+}
+
+cmd_watch() {
+  local secs="${1:-$REFRESH}"
+  say "refreshing the status feed every ${secs}s (Ctrl-C to stop)"
+  while true; do
+    cmd_status >/dev/null 2>&1
+    sleep "$secs"
+  done
+}
+
+cmd_url() {
+  say "open the console"
+  echo "    ${URL_BASE}/nsm/     (from this container)"
+  echo "    https://localhost/nsm/   (from the Windows host)"
+  echo
+  echo "    It is behind the same nginx auth as the rest of Malcolm."
+}
+
+case "${1:-help}" in
+  install) shift; cmd_install "$@" ;;
+  build)   shift; cmd_build "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  watch)   shift; cmd_watch "$@" ;;
+  url)     shift; cmd_url "$@" ;;
+  help|*)  sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac

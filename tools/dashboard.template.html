@@ -1,0 +1,556 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width,initial-scale=1">
+<title>NSM console</title>
+<!--
+  Single-pane console for the ER4/Malcolm deployment.
+
+  SERVED BY MALCOLM'S OWN NGINX, which is the whole design.  Dropping this file
+  into the static root means it is same-origin with /mapi/, /arkime/ and the
+  OpenSearch console proxy, so the BROWSER is the query client: live drill-down
+  with no new service, no new port and no new process on a host that has no
+  memory headroom to give one.
+
+  Two data sources, deliberately different:
+
+    status.json  - written by tools/dashboard-status.py.  Pipeline health:
+                   memory, watcher threads, queue depth, 9p latency, snapshots.
+                   None of it exists in any index, which is exactly why neither
+                   Arkime nor OpenSearch Dashboards can show it.
+    live queries - the session index, through the console proxy.  Network
+                   behaviour, and every drill-down.
+
+  THIS FILE IS COMMITTED AND THE REPO IS PUBLIC, so it contains no addresses, no
+  hostnames and no data - only the code that fetches them at runtime.
+
+  A FAILED QUERY MUST NOT LOOK LIKE AN EMPTY RESULT.  This deployment's recurring
+  lesson is that aggregations return 0 rather than erroring, so every panel here
+  distinguishes "no data" from "the query failed" and says which.
+-->
+<style>
+  :root{
+    --bg:#0d1117; --panel:#161b22; --line:#293241; --ink:#e6edf3; --dim:#8b949e;
+    --ok:#3fb950; --warn:#d29922; --bad:#f85149; --accent:#58a6ff; --mute:#6e7681;
+  }
+  *{box-sizing:border-box}
+  body{margin:0;background:var(--bg);color:var(--ink);
+       font:13px/1.5 ui-monospace,SFMono-Regular,Menlo,Consolas,monospace}
+  a{color:var(--accent);text-decoration:none} a:hover{text-decoration:underline}
+  header{position:sticky;top:0;z-index:20;background:#0d1117ee;backdrop-filter:blur(6px);
+         border-bottom:1px solid var(--line);padding:10px 16px;display:flex;gap:14px;align-items:center;flex-wrap:wrap}
+  h1{font-size:14px;margin:0;letter-spacing:.5px;font-weight:600}
+  .pill{padding:2px 9px;border-radius:10px;font-size:11px;font-weight:600;border:1px solid}
+  .pill.ok{color:var(--ok);border-color:#2ea04366;background:#2ea04318}
+  .pill.warn{color:var(--warn);border-color:#d2992266;background:#d2992218}
+  .pill.bad{color:var(--bad);border-color:#f8514966;background:#f8514918}
+  .spacer{flex:1}
+  .muted{color:var(--dim)}
+  main{padding:16px;display:grid;gap:14px}
+  .grid{display:grid;gap:14px;grid-template-columns:repeat(auto-fit,minmax(300px,1fr))}
+  .card{background:var(--panel);border:1px solid var(--line);border-radius:8px;padding:12px 14px;min-width:0}
+  .card h2{font-size:11px;margin:0 0 10px;color:var(--dim);text-transform:uppercase;letter-spacing:.9px;
+           font-weight:600;display:flex;align-items:center;gap:8px}
+  .big{font-size:24px;font-weight:600;line-height:1.1}
+  .sub{font-size:11px;color:var(--dim);margin-top:2px}
+  table{width:100%;border-collapse:collapse;font-size:12px}
+  th{text-align:left;color:var(--dim);font-weight:500;padding:3px 6px 5px;border-bottom:1px solid var(--line);
+     font-size:10px;text-transform:uppercase;letter-spacing:.6px}
+  td{padding:3px 6px;border-bottom:1px solid #21262d}
+  tr[data-drill]{cursor:pointer}
+  tr[data-drill]:hover{background:#1f6feb22}
+  .num{text-align:right;font-variant-numeric:tabular-nums;white-space:nowrap}
+  .bar{height:3px;background:var(--accent);border-radius:2px;min-width:1px;opacity:.65}
+  .tag{font-size:9px;padding:1px 5px;border-radius:8px;background:#30363d;color:var(--dim);margin-left:6px;
+       text-transform:uppercase;letter-spacing:.5px}
+  .tag.obs{background:#1f6feb33;color:var(--accent)}
+  .err{color:var(--bad);font-size:11px;padding:6px 0}
+  .empty{color:var(--mute);font-size:11px;padding:6px 0;font-style:italic}
+  .kv{display:flex;justify-content:space-between;gap:10px;padding:2px 0;font-size:12px}
+  .kv b{font-weight:600}
+  select,button{background:#21262d;color:var(--ink);border:1px solid var(--line);border-radius:6px;
+                padding:3px 8px;font:inherit;font-size:12px;cursor:pointer}
+  button:hover,select:hover{border-color:var(--accent)}
+  #drill{position:fixed;inset:auto 0 0 0;height:62vh;background:var(--panel);border-top:2px solid var(--accent);
+         z-index:40;overflow:auto;padding:14px 18px;display:none;box-shadow:0 -12px 40px #0009}
+  #drill.open{display:block}
+  #drill h3{margin:0 0 4px;font-size:14px}
+  .close{position:absolute;top:12px;right:16px}
+  .spark{display:block;width:100%;height:34px}
+  .flag{display:inline-block;width:7px;height:7px;border-radius:50%;margin-right:6px;vertical-align:middle}
+  .flag.ok{background:var(--ok)} .flag.warn{background:var(--warn)} .flag.bad{background:var(--bad)}
+  .stale{color:var(--warn)}
+  code{background:#21262d;padding:1px 4px;border-radius:3px;font-size:11px}
+</style>
+</head>
+<body>
+<header>
+  <h1>NSM CONSOLE</h1>
+  <span id="verdict" class="pill warn">starting</span>
+  <span class="muted" id="age">-</span>
+  <span class="spacer"></span>
+  <label class="muted">window
+    <select id="range">
+      <option value="1h">1h</option>
+      <option value="6h">6h</option>
+      <option value="24h" selected>24h</option>
+      <option value="7d">7d</option>
+    </select>
+  </label>
+  <button id="refresh">refresh</button>
+  <a href="/arkime/" target="_blank">Arkime</a>
+  <a href="/dashboards/" target="_blank">Dashboards</a>
+</header>
+
+<main>
+  <section class="grid" id="health"></section>
+  <section class="grid" id="network"></section>
+</main>
+
+<div id="drill">
+  <button class="close" onclick="closeDrill()">close</button>
+  <h3 id="drill-title">-</h3>
+  <div class="muted" id="drill-sub"></div>
+  <div id="drill-body" style="margin-top:12px"></div>
+</div>
+
+<script>
+"use strict";
+const IDX = "arkime_sessions3-*";
+let STATUS = null, RANGE = "24h", timer = null, tick = null;
+
+/* ---------- helpers ------------------------------------------------------ */
+/* Returns ALL roots, not just the first.
+   The obvious one-liner (`d.innerHTML = h; return d.firstChild`) silently drops
+   every element after the first, so a card built from one multi-element string
+   rendered its headline and quietly discarded the numbers underneath it - no
+   error, no gap, just missing information. A <template> also parses table rows
+   correctly, which a <div> wrapper does not. */
+const el = (h) => {
+  const t = document.createElement("template");
+  t.innerHTML = h.trim();
+  return t.content.childElementCount === 1 ? t.content.firstElementChild : t.content;
+};
+const esc = (s) => String(s ?? "").replace(/[<>&"]/g, c => ({"<":"&lt;",">":"&gt;","&":"&amp;",'"':"&quot;"}[c]));
+const bytes = (n) => {
+  if (n == null) return "-";
+  const u = ["B","KB","MB","GB","TB"]; let i = 0;
+  while (n >= 1024 && i < u.length - 1) { n /= 1024; i++; }
+  return n.toFixed(n < 10 && i > 0 ? 1 : 0) + " " + u[i];
+};
+const dur = (s) => {
+  if (s == null || s < 0) return "-";
+  if (s < 90) return s + "s";
+  if (s < 5400) return Math.round(s / 60) + "m";
+  if (s < 172800) return (s / 3600).toFixed(1) + "h";
+  return (s / 86400).toFixed(1) + "d";
+};
+
+/* Query OpenSearch through the console proxy. Same-origin, so the basic-auth
+   credentials the browser already holds for this page are reused - no token
+   handling, no CORS, no second login. */
+async function es(path, body) {
+  const url = `/dashboards/api/console/proxy?path=${encodeURIComponent(path)}&method=POST`;
+  const r = await fetch(url, {
+    method: "POST", credentials: "same-origin",
+    headers: { "osd-xsrf": "true", "Content-Type": "application/json" },
+    body: JSON.stringify(body),
+  });
+  if (!r.ok) throw new Error("HTTP " + r.status);
+  const j = await r.json();
+  if (j.error) throw new Error(j.error.type || "query error");
+  return j;
+}
+
+const timeFilter = () => ({ range: { "@timestamp": { gte: "now-" + RANGE } } });
+
+/* Every panel routes through this so a FAILED query can never be mistaken for
+   an empty one. Aggregations here return 0 buckets rather than erroring when a
+   field is mapped wrong, and that has manufactured false conclusions before. */
+async function panel(node, fn) {
+  try {
+    const out = await fn();
+    node.innerHTML = "";
+    node.append(out);
+  } catch (e) {
+    node.innerHTML = `<div class="err">query failed: ${esc(e.message)}</div>`;
+  }
+}
+
+function table(cols, rows, opts = {}) {
+  if (!rows.length) { const d = document.createElement("div"); d.className = "empty"; d.textContent = opts.empty || "no data in this window"; return d; }
+  const max = Math.max(...rows.map(r => Number(r.bar) || 0), 1);
+  const t = document.createElement("table");
+  t.innerHTML = `<thead><tr>${cols.map(c => `<th class="${c.num ? "num" : ""}">${esc(c.label)}</th>`).join("")}</tr></thead>`;
+  const tb = document.createElement("tbody");
+  for (const r of rows) {
+    const tr = document.createElement("tr");
+    if (r.drill) { tr.dataset.drill = "1"; tr.onclick = () => openDrill(r.drill.field, r.drill.value); }
+    tr.innerHTML = cols.map(c => {
+      const v = r[c.key];
+      return `<td class="${c.num ? "num" : ""}">${c.raw ? v : esc(v)}</td>`;
+    }).join("");
+    tb.append(tr);
+    if (r.bar != null) {
+      const b = document.createElement("tr");
+      b.innerHTML = `<td colspan="${cols.length}" style="padding:0 6px 4px;border:0">
+        <div class="bar" style="width:${(100 * r.bar / max).toFixed(1)}%"></div></td>`;
+      tb.append(b);
+    }
+  }
+  t.append(tb);
+  return t;
+}
+
+function sparkline(points, floor) {
+  if (points.length < 2) return el(`<div class="empty">not enough samples yet</div>`);
+  const xs = points.map(p => p[0]), ys = points.map(p => p[1]);
+  const x0 = Math.min(...xs), x1 = Math.max(...xs);
+  const y1 = Math.max(...ys, floor || 0) * 1.05, y0 = 0;
+  const px = (x) => ((x - x0) / Math.max(1, x1 - x0)) * 100;
+  const py = (y) => 100 - ((y - y0) / Math.max(1, y1 - y0)) * 100;
+  const d = points.map((p, i) => `${i ? "L" : "M"}${px(p[0]).toFixed(2)},${py(p[1]).toFixed(2)}`).join(" ");
+  const fl = floor ? `<line x1="0" y1="${py(floor).toFixed(2)}" x2="100" y2="${py(floor).toFixed(2)}"
+                       stroke="var(--bad)" stroke-width="0.8" stroke-dasharray="2,2" vector-effect="non-scaling-stroke"/>` : "";
+  return el(`<svg class="spark" viewBox="0 0 100 100" preserveAspectRatio="none">
+    ${fl}<path d="${d}" fill="none" stroke="var(--accent)" stroke-width="1.4" vector-effect="non-scaling-stroke"/></svg>`);
+}
+
+function card(title, extra = "") {
+  const c = el(`<div class="card"><h2>${esc(title)}${extra}</h2><div class="body"></div></div>`);
+  return { card: c, body: c.querySelector(".body") };
+}
+
+/* ---------- pipeline health (from status.json) --------------------------- */
+function renderHealth() {
+  const host = document.getElementById("health");
+  host.innerHTML = "";
+  const s = STATUS;
+  if (!s) { host.append(el(`<div class="card"><div class="err">status.json unavailable - is tools/dashboard status running?</div></div>`)); return; }
+  const problems = [];
+
+  /* memory: the counter that matters here is MemFree as well as MemAvailable,
+     because available counts page cache as if it were already yours. */
+  {
+    const m = s.mem, t = s.trend || {};
+    const bad = m.avail_mb < m.floor_avail_mb, warn = m.free_mb < m.floor_free_mb;
+    if (bad) problems.push("memory at the floor");
+    else if (warn) problems.push("free memory low");
+    const { card: c, body } = card("host memory");
+    body.append(el(`<div class="big" style="color:${bad ? "var(--bad)" : warn ? "var(--warn)" : "var(--ok)"}">
+        ${m.avail_mb} MB <span style="font-size:12px;color:var(--dim)">available</span></div>
+      <div class="sub">${m.free_mb} MB free (floor ${m.floor_free_mb}) &middot; swap ${m.swap_pct}% &middot; floor ${m.floor_avail_mb} MB</div>`));
+    body.append(sparkline((t.samples || []).map(x => [x[0], x[1]]), m.floor_avail_mb));
+    const eta = [];
+    if (t.avail_eta_min >= 0) eta.push(`available reaches its floor in ~${t.avail_eta_min}m`);
+    if (t.free_eta_min >= 0) eta.push(`free in ~${t.free_eta_min}m`);
+    body.append(el(`<div class="sub">${eta.length ? "projected: " + esc(eta.join(", ")) : "not falling"}</div>`));
+    if (eta.length) problems.push("memory falling");
+    host.append(c);
+  }
+
+  /* watchers: a thread below the learned healthy peak is the stall signature. */
+  {
+    const { card: c, body } = card("watcher threads");
+    const rows = (s.watchers || []).map(w => ({
+      role: w.role,
+      th: `${w.threads}${w.peak ? " / " + w.peak : ""}`,
+      up: dur(w.age_sec),
+      st: w.degraded ? `<span class="flag bad"></span>thread lost`
+        : w.age_sec < 120 ? `<span class="flag warn"></span>starting`
+        : `<span class="flag ok"></span>ok`,
+    }));
+    (s.watchers || []).forEach(w => { if (w.degraded) problems.push(w.role + " lost a thread"); });
+    body.append(table(
+      [{ key: "role", label: "watcher" }, { key: "th", label: "threads", num: true },
+       { key: "up", label: "uptime", num: true }, { key: "st", label: "state", raw: true }], rows));
+    body.append(el(`<div class="sub">peak is learned only from a watcher that is draining</div>`));
+    host.append(c);
+  }
+
+  /* queues: depth AND head age - a deep queue that moves is fine. */
+  {
+    const { card: c, body } = card("spool queues");
+    const rows = (s.queues || []).map(q => ({
+      name: q.name, pending: q.pending,
+      age: q.head_age_sec >= 0 ? dur(q.head_age_sec) : "-",
+      st: q.pending === 0 ? `<span class="flag ok"></span>empty`
+        : q.head_age_sec > 900 ? `<span class="flag warn"></span>head is old`
+        : `<span class="flag ok"></span>moving`,
+    }));
+    (s.queues || []).forEach(q => { if (q.name === "quarantine" && q.pending > 0) problems.push("captures in quarantine"); });
+    body.append(table([{ key: "name", label: "queue" }, { key: "pending", label: "pending", num: true },
+                       { key: "age", label: "head age", num: true }, { key: "st", label: "state", raw: true }], rows));
+    host.append(c);
+  }
+
+  /* the 9p mount against the settle window - late by construction above it. */
+  {
+    const f = s.fs || {}, { card: c, body } = card("filesystem latency");
+    if (!f.available) body.append(el(`<div class="empty">stall probe not running - tools/stall-probe start</div>`));
+    else {
+      const over = f.listdir_p95_ms > f.settle_sec * 1000;
+      if (over) problems.push("directory scans exceed the settle window");
+      body.append(el(`<div class="big" style="color:${over ? "var(--warn)" : "var(--ok)"}">${f.listdir_p95_ms} ms
+          <span style="font-size:12px;color:var(--dim)">p95 scan</span></div>
+        <div class="sub">p50 ${f.listdir_p50_ms} ms &middot; max ${f.listdir_max_ms} ms &middot; ${f.entries} entries</div>
+        <div class="sub">settle window ${f.settle_sec}s &middot; ${f.over_settle}/${f.samples} scans exceeded it</div>
+        <div class="sub">at the ${f.retain_files}-file retention steady state, p95 projects to
+          <b style="color:${f.projected_p95_s > f.settle_sec ? "var(--warn)" : "var(--ok)"}">${f.projected_p95_s}s</b></div>`));
+    }
+    host.append(c);
+  }
+
+  /* cluster + snapshots: "can I lose data, and could I get it back" */
+  {
+    const cl = s.cluster || {}, sn = s.snapshots || {}, { card: c, body } = card("index & recovery");
+    if (!cl.reachable) { body.append(el(`<div class="err">cluster unreachable</div>`)); problems.push("cluster unreachable"); }
+    else {
+      if (cl.status !== "green") problems.push("cluster " + cl.status);
+      body.append(el(`<div class="kv"><span>cluster</span><b style="color:${
+        cl.status === "green" ? "var(--ok)" : cl.status === "yellow" ? "var(--warn)" : "var(--bad)"}">${esc(cl.status)}</b></div>
+        <div class="kv"><span>unassigned shards</span><b>${cl.unassigned}</b></div>
+        <div class="kv"><span>documents</span><b>${cl.docs.toLocaleString()}</b></div>
+        <div class="kv"><span>index size</span><b>${cl.size_gb} GB</b></div>`));
+    }
+    if (sn.available) {
+      const stale = sn.latest_age_sec > 172800;
+      if (stale || !sn.successful) problems.push("snapshots stale");
+      body.append(el(`<div class="kv" style="margin-top:6px;border-top:1px solid var(--line);padding-top:6px">
+          <span>snapshots</span><b>${sn.successful}</b></div>
+        <div class="kv"><span>newest</span><b class="${stale ? "stale" : ""}">${dur(sn.latest_age_sec)} ago</b></div>
+        <div class="sub">prove it restores: <code>tools/snapshot verify</code></div>`));
+    } else body.append(el(`<div class="sub">no snapshot repository - <code>tools/snapshot init</code></div>`));
+    host.append(c);
+  }
+
+  /* incident history - every forensics dump the watchdog took before repairing */
+  {
+    const inc = s.incidents || [], { card: c, body } = card("stalls healed", `<span class="tag">${inc.length}</span>`);
+    if (!inc.length) body.append(el(`<div class="empty">no stalls recorded</div>`));
+    else {
+      const byLabel = {};
+      inc.forEach(i => { const k = i.label.replace(/^(thread-lost|queue-wedged)-/, "$1 "); byLabel[k] = (byLabel[k] || 0) + 1; });
+      const now = Date.now() / 1000;
+      body.append(table([{ key: "k", label: "kind" }, { key: "n", label: "count", num: true }],
+        Object.entries(byLabel).sort((a, b) => b[1] - a[1]).map(([k, n]) => ({ k, n, bar: n }))));
+      const last = inc[inc.length - 1];
+      body.append(el(`<div class="sub">most recent ${dur(Math.round(now - last.t))} ago &middot; ${esc(last.label)}</div>
+        <div class="sub">dumps in <code>${esc("$STATE_DIR/forensics")}</code></div>`));
+    }
+    host.append(c);
+  }
+
+  const v = document.getElementById("verdict");
+  v.className = "pill " + (problems.some(p => /floor|unreachable|red|lost/.test(p)) ? "bad" : problems.length ? "warn" : "ok");
+  v.textContent = problems.length ? problems[0] + (problems.length > 1 ? ` +${problems.length - 1}` : "") : "healthy";
+  v.title = problems.join("\n") || "no problems detected";
+}
+
+/* ---------- network (live queries) --------------------------------------- */
+function isObserver(ip) { return (STATUS?.observer_dests || []).includes(ip); }
+
+async function termsPanel(body, { field, dataset, metric, label, valueFmt, extraFilter }) {
+  const filter = [timeFilter()];
+  if (dataset) filter.push({ term: { "event.dataset": dataset } });
+  if (extraFilter) filter.push(...extraFilter);
+  const aggs = metric
+    ? { t: { terms: { field, size: 10, order: { m: "desc" } }, aggs: { m: { sum: { field: metric } } } } }
+    : { t: { terms: { field, size: 10 } } };
+  const r = await es(`${IDX}/_search`, { size: 0, query: { bool: { filter } }, aggs });
+  const buckets = r.aggregations?.t?.buckets || [];
+  return table(
+    [{ key: "k", label: label || field, raw: true }, { key: "v", label: metric ? "bytes" : "count", num: true }],
+    buckets.map(b => {
+      const val = metric ? b.m.value : b.doc_count;
+      const obs = isObserver(b.key);
+      return {
+        k: esc(b.key) + (obs ? `<span class="tag obs">observer</span>` : ""),
+        v: valueFmt ? valueFmt(val) : val.toLocaleString(),
+        bar: val, drill: { field, value: b.key },
+      };
+    }));
+}
+
+function renderNetwork() {
+  const host = document.getElementById("network");
+  host.innerHTML = "";
+  const mk = (title, note, fn) => {
+    const { card: c, body } = card(title);
+    host.append(c);
+    panel(body, fn).then(() => { if (note) c.append(el(`<div class="sub">${note}</div>`)); });
+  };
+
+  /* Upload asymmetry is the interesting axis: normal browsing is download
+     heavy, so a destination that RECEIVES far more than it sends is a backup,
+     a sync client - or an exfiltration path. The observer tag matters here:
+     unlabelled, the monitoring's own egress is the most alarming row present. */
+  mk("upload destinations", "bytes sent from the network &middot; click a row to drill in", () =>
+    termsPanel(null, { field: "destination.ip", metric: "client.bytes", label: "destination", valueFmt: bytes }));
+
+  mk("top talkers", "local hosts by bytes sent", () =>
+    termsPanel(null, { field: "source.ip", metric: "client.bytes", label: "source", valueFmt: bytes }));
+
+  /* tls.client.server_name is mapped as text and never aggregates - it returns
+     zero buckets with no error. server.domain is the one that works. */
+  mk("TLS destinations", "server.domain &middot; SNI, not certificates", () =>
+    termsPanel(null, { field: "server.domain", dataset: "ssl", label: "domain" }));
+
+  mk("DNS names", "most queried", () =>
+    termsPanel(null, { field: "dns.host", dataset: "dns", label: "name" }));
+
+  mk("NXDOMAIN", "names that do not exist, asked repeatedly - always a misconfiguration", () =>
+    termsPanel(null, {
+      field: "dns.host", dataset: "dns", label: "name",
+      extraFilter: [{ term: { "zeek.dns.rcode_name": "NXDOMAIN" } }],
+    }));
+
+  /* The half an NXDOMAIN leaderboard cannot see: an unanswered multicast query
+     carries no rcode at all, so it never reaches that board. Measured here once
+     at 8x the unicast volume. */
+  mk("unanswered LLMNR / mDNS", "multicast name queries with no response - a name-spoofing foothold", async () => {
+    const r = await es(`${IDX}/_search`, {
+      size: 0, track_total_hits: true,
+      query: { bool: {
+        filter: [timeFilter(), { terms: { "destination.ip": ["224.0.0.252", "224.0.0.251"] } }],
+        must_not: [{ exists: { field: "zeek.dns.rcode_name" } }] } },
+      aggs: { t: { terms: { field: "source.ip", size: 6 } } },
+    });
+    const total = r.hits?.total?.value ?? 0;
+    const wrap = document.createElement("div");
+    wrap.append(el(`<div class="big" style="color:${total > 1000 ? "var(--warn)" : "var(--ok)"}">${total.toLocaleString()}</div>
+      <div class="sub">unanswered queries in the last ${RANGE}</div>`));
+    wrap.append(table([{ key: "k", label: "source" }, { key: "v", label: "count", num: true }],
+      (r.aggregations?.t?.buckets || []).map(b => ({ k: b.key, v: b.doc_count.toLocaleString(), bar: b.doc_count,
+        drill: { field: "source.ip", value: b.key } }))));
+    return wrap;
+  });
+
+  mk("suricata alerts", "by rule", () =>
+    termsPanel(null, { field: "rule.name", dataset: "alert", label: "rule" }));
+
+  mk("destination ports", "where traffic is going", () =>
+    termsPanel(null, { field: "destination.port", label: "port" }));
+}
+
+/* ---------- drill-down ---------------------------------------------------- */
+async function openDrill(field, value) {
+  const d = document.getElementById("drill");
+  d.classList.add("open");
+  document.getElementById("drill-title").textContent = `${field} = ${value}`;
+  document.getElementById("drill-sub").textContent = `last ${RANGE}`;
+  const body = document.getElementById("drill-body");
+  body.innerHTML = `<div class="muted">querying…</div>`;
+
+  try {
+    const filter = [timeFilter(), { term: { [field]: value } }];
+    const r = await es(`${IDX}/_search`, {
+      size: 0, track_total_hits: true,
+      query: { bool: { filter } },
+      aggs: {
+        peers_src: { terms: { field: "source.ip", size: 8 } },
+        peers_dst: { terms: { field: "destination.ip", size: 8 } },
+        ports: { terms: { field: "destination.port", size: 8 } },
+        domains: { terms: { field: "server.domain", size: 8 } },
+        up: { sum: { field: "client.bytes" } },
+        down: { sum: { field: "server.bytes" } },
+        /* Source-port cardinality is what separates a beacon from one long-lived
+           connection: both look identical on a coverage histogram, but a beacon
+           opens a new socket per check-in and burns ephemeral ports. */
+        srcports: { cardinality: { field: "source.port" } },
+        over_time: { date_histogram: { field: "@timestamp", fixed_interval: "30m", min_doc_count: 0 } },
+      },
+    });
+    const a = r.aggregations, sessions = r.hits?.total?.value ?? 0;
+    const up = a.up.value || 0, down = a.down.value || 0;
+    const buckets = a.over_time.buckets || [];
+    const covered = buckets.filter(b => b.doc_count > 0).length;
+
+    const wrap = document.createElement("div");
+    wrap.append(el(`<div class="grid">
+      <div class="card"><h2>volume</h2>
+        <div class="kv"><span>sessions</span><b>${sessions.toLocaleString()}</b></div>
+        <div class="kv"><span>uploaded</span><b>${bytes(up)}</b></div>
+        <div class="kv"><span>downloaded</span><b>${bytes(down)}</b></div>
+        <div class="kv"><span>ratio up:down</span><b>${down ? (up / down).toFixed(2) : "&infin;"}</b></div>
+        ${isObserver(value) ? `<div class="sub" style="color:var(--accent)">this is the monitoring's own egress (OBSERVER_DESTS)</div>` : ""}
+      </div>
+      <div class="card"><h2>periodicity</h2>
+        <div class="kv"><span>30m buckets seen in</span><b>${covered} / ${buckets.length}</b></div>
+        <div class="kv"><span>distinct source ports</span><b>${(a.srcports.value || 0).toLocaleString()}</b></div>
+        <div class="sub">${
+          covered / Math.max(1, buckets.length) > 0.9 && a.srcports.value > 50
+            ? "present in nearly every bucket with many source ports - beacon-shaped"
+            : covered / Math.max(1, buckets.length) > 0.9
+            ? "present in nearly every bucket but reusing few ports - a long-lived connection, not a beacon"
+            : "intermittent"}</div>
+      </div></div>`));
+
+    const spark = buckets.map(b => [b.key / 1000, b.doc_count]);
+    const sc = el(`<div class="card" style="margin-top:12px"><h2>sessions over time</h2></div>`);
+    sc.append(sparkline(spark, 0));
+    wrap.append(sc);
+
+    const g = el(`<div class="grid" style="margin-top:12px"></div>`);
+    const addT = (title, buckets2, f) => {
+      const { card: c, body: b } = card(title);
+      b.append(table([{ key: "k", label: "value" }, { key: "v", label: "sessions", num: true }],
+        (buckets2 || []).map(x => ({ k: x.key, v: x.doc_count.toLocaleString(), bar: x.doc_count,
+          drill: f ? { field: f, value: x.key } : null }))));
+      g.append(c);
+    };
+    addT("peer sources", a.peers_src.buckets, "source.ip");
+    addT("peer destinations", a.peers_dst.buckets, "destination.ip");
+    addT("ports", a.ports.buckets, null);
+    addT("TLS domains", a.domains.buckets, null);
+    wrap.append(g);
+
+    wrap.append(el(`<div class="sub" style="margin-top:12px">
+      open in Arkime:
+      <a target="_blank" href="/arkime/sessions?expression=${encodeURIComponent(field + " == " + value)}&date=-1">full sessions and packets</a>
+      &middot; GeoIP city data is years stale - confirm attribution with RDAP before acting on it
+    </div>`));
+
+    body.innerHTML = ""; body.append(wrap);
+  } catch (e) {
+    body.innerHTML = `<div class="err">drill-down failed: ${esc(e.message)}</div>`;
+  }
+}
+function closeDrill() { document.getElementById("drill").classList.remove("open"); }
+document.addEventListener("keydown", e => { if (e.key === "Escape") closeDrill(); });
+
+/* ---------- refresh loop -------------------------------------------------- */
+async function loadStatus() {
+  try {
+    const r = await fetch("status.json?t=" + Date.now(), { cache: "no-store" });
+    STATUS = await r.json();
+  } catch (e) { STATUS = null; }
+  renderHealth();
+  updateAge();
+}
+
+function updateAge() {
+  const a = document.getElementById("age");
+  if (!STATUS) { a.textContent = "status unavailable"; a.className = "stale"; return; }
+  const age = Math.round(Date.now() / 1000 - STATUS.generated);
+  /* Say how old the data is rather than implying it is live. A page that stops
+     updating silently is the same class of failure as a watcher that stops
+     silently - and this deployment has enough of those. */
+  a.textContent = `pipeline data ${dur(age)} old`;
+  a.className = age > (STATUS.refresh_sec || 60) * 3 ? "stale" : "muted";
+}
+
+function start() {
+  RANGE = document.getElementById("range").value;
+  loadStatus(); renderNetwork();
+  clearInterval(timer); clearInterval(tick);
+  timer = setInterval(loadStatus, (STATUS?.refresh_sec || 60) * 1000);
+  tick = setInterval(updateAge, 5000);
+}
+document.getElementById("range").onchange = () => { RANGE = document.getElementById("range").value; renderNetwork(); };
+document.getElementById("refresh").onclick = () => { loadStatus(); renderNetwork(); };
+start();
+</script>
+</body>
+</html>

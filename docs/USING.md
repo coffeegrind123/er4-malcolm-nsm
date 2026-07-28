@@ -277,6 +277,42 @@ Every run also records a memory sample and, before any repair, writes a
 forensics dump of the stalled watcher to `${TMPDIR:-/tmp}/er4-watchdog/forensics/`.
 Collect before you heal, or every incident stays unexplained.
 
+## The console — one page for pipeline health and network behaviour
+
+```sh
+tools/dashboard install   # bind-mount it into Malcolm's nginx (once)
+tools/dashboard build     # re-render after changing the template
+tools/dashboard url       # where to open it
+```
+
+Then open **`https://<collector>/nsm/`**, behind the same auth as everything else.
+
+It exists because Arkime and OpenSearch Dashboards answer "what is on the
+network" well and cannot answer "is the pipeline healthy" at all — the failures
+here (a watcher thread dying, the host running out of memory, captures landing in
+a directory nothing polls, a snapshot never proven to restore) do not exist in
+any index, so no amount of dashboarding inside OpenSearch can surface them.
+
+**Top half — pipeline health**, from `status.json`: memory with its trend and
+projected time-to-floor, watcher threads against their learned healthy peak,
+spool queue depth and head age, 9p scan latency against the settle window,
+cluster and snapshot state, and a count of every stall the watchdog has healed.
+
+**Bottom half — the network**, queried live: upload destinations (with
+`OBSERVER_DESTS` rows tagged, or your own tooling tops the list), top talkers,
+TLS domains, DNS and NXDOMAIN, unanswered LLMNR/mDNS, Suricata alerts and
+destination ports. Click any row to drill in: volume and up/down ratio,
+periodicity with source-port cardinality — which is what separates a beacon from
+one long-lived connection — peers, ports, TLS domains, and a link into Arkime for
+the packets.
+
+No new service runs for any of this. The page is static and served by Malcolm's
+own nginx, which makes it same-origin with the APIs, so the browser does the
+querying. Only `status.json` is written server-side, refreshed by every
+`tools/watchdog` run; for a faster cadence run `tools/dashboard watch 60`. The
+header always shows how old that data is, so a stopped refresher looks stale
+rather than quietly serving old numbers as current.
+
 ## Snapshots — the thing that makes an index loss survivable
 
 An OOM-corrupted index **cannot be repaired**: `allocate_empty_primary` still

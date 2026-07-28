@@ -169,6 +169,31 @@ fi
 #
 # It is deliberately best-effort and time-bounded. A forensics collection that
 # hangs would delay the repair, and the repair matters more than the diagnosis.
+# RESTART AT MOST ONCE PER SERVICE PER RUN.
+#
+# Several checks can independently conclude that the same container needs a
+# restart - the publisher and the mover both live in pcap-monitor, and the
+# queue-age check covers the same ground again. Seen live: one run restarted
+# pcap-monitor three times in ninety seconds, and each restart drops whatever
+# was in flight and re-enters --start-sleep, so the third one undid any progress
+# the first had made.
+#
+# That is the self-inflicted restart loop this file already warns about, arriving
+# by a new route. One restart per service per run; later checks report but do
+# not act.
+RESTARTED_SVCS=""
+already_restarted() { [[ " ${RESTARTED_SVCS} " == *" $1 "* ]]; }
+restart_svc() { # restart_svc <service> <reason>
+  if already_restarted "$1"; then
+    echo "  already restarted ${1} this run - not restarting again for $2"
+    return 1
+  fi
+  echo "  healing: restarting ${1}"
+  (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$1" >/dev/null 2>&1)
+  RESTARTED_SVCS="${RESTARTED_SVCS} $1"
+  return 0
+}
+
 forensics() { # forensics <label>
   [[ -x "${HERE}/stall-probe" ]] || return 0
   local out
@@ -221,8 +246,7 @@ if [[ -n "${newest:-}" && "${newest:-0}" -gt 0 ]]; then
       report "PUBLISHER STALLED (captures arriving, last publish ${lag}s older than newest capture)"
       if [[ "$HEAL" -eq 1 ]]; then
         forensics "publisher-stall"
-        echo "  healing: restarting ${MONITOR_CONTAINER}"
-        if (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart pcap-monitor >/dev/null 2>&1); then
+        if restart_svc pcap-monitor "publisher stall"; then
           date -u +%s > "$pstate"
           echo "  restarted - will not restart again for ${RESTART_ESCALATE_SECS:-900}s"
         fi
@@ -339,10 +363,8 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
 
     report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, consumer produced no events)"
     if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
-      forensics "queue-wedged-$(echo "$label" | tr '/' '_')"
-      echo "  healing: restarting ${svc}"
-      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
-      date -u +%s > "$rstate"
+      if ! already_restarted "$svc"; then forensics "queue-wedged-$(echo "$label" | tr '/' '_')"; fi
+      restart_svc "$svc" "${label}" && date -u +%s > "$rstate"
     fi
     return 0
   fi
@@ -454,12 +476,10 @@ check_threads() {
 
     report "WATCHER THREAD LOST: ${role} has ${count} threads (peak ${peak}) and produced no events in 5m"
     if [[ "$HEAL" -eq 1 ]]; then
-      forensics "thread-lost-${role}"
-      echo "  healing: restarting ${svc}"
-      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
+      if ! already_restarted "$svc"; then forensics "thread-lost-${role}"; fi
       # The peak is re-learned after a restart; a stale peak from a previous
       # container would otherwise make every fresh start look degraded.
-      rm -f "$pstate"
+      restart_svc "$svc" "${role}" && rm -f "$pstate"
     fi
   done < <("${HERE}/stall-probe" threads 2>/dev/null)
 }
@@ -467,5 +487,14 @@ check_threads
 
 check_queue "pcap/upload"      "$PCAP_MOUNT" "upload/*.pcap"    "pcap-monitor"
 check_queue "zeek-logs/upload" "$ZEEK_MOUNT" "upload/*.tar.gz" "filebeat"
+
+# Refresh the console's status feed. Best-effort and time-bounded: the dashboard
+# is an output of this script, never a dependency of it, so a slow or broken
+# refresh must not delay a repair or change the exit status. The page displays
+# the age of this data, so a refresher that stops shows as a stale timestamp
+# rather than as a page quietly presenting old numbers as current.
+if [[ -x "${HERE}/dashboard" ]]; then
+  timeout 60 "${HERE}/dashboard" status >/dev/null 2>&1 || true
+fi
 
 exit $(( problems > 0 ))

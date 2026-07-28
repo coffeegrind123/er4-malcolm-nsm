@@ -259,6 +259,43 @@ using it. Size against what is actually free.
 
 ---
 
+## The console
+
+### Serve it from Malcolm's nginx, and the browser becomes the query client
+
+The console needs live queries and drill-down, but this host cannot afford
+another long-running service. Dropping the page into Malcolm's existing nginx
+static root solves both at once: `location /` and `/mapi/`, `/arkime/`,
+`/dashboards/` are in the SAME server block, so the page is same-origin with
+every API and inherits the same basic auth. `fetch()` from the page just works -
+no CORS, no token handling, no second login, and nothing new running.
+
+Only a bind mount is needed (`tools/dashboard install`). Use a SUBDIRECTORY of
+the static root so a Malcolm upgrade cannot overwrite the landing page or be
+overwritten by it.
+
+Two traps when testing this with a headless browser:
+
+- **Credentials in the URL break every `fetch` on the page.** Navigating to
+  `https://user:pass@host/nsm/` loads fine and then every panel fails with
+  *"Request cannot be constructed from a URL that includes credentials"*. It
+  looks exactly like a broken page. Authenticate once, then navigate to the
+  clean URL.
+- **`innerHTML` + `firstChild` silently drops content.** A helper that does
+  `d.innerHTML = html; return d.firstChild` returns only the FIRST element, so a
+  card built from one multi-element string renders its headline and discards the
+  numbers underneath - no error, no gap, just missing information. Use a
+  `<template>` and return the whole fragment; it also parses `<tr>` correctly,
+  which a `<div>` wrapper does not.
+
+### A failed query must not look like an empty result
+
+The recurring lesson of this whole deployment, and it applies hardest to a UI:
+aggregations return zero buckets rather than erroring when a field is mapped
+wrong. Every panel must distinguish "no data in this window" from "the query
+failed", and say which. A dashboard that renders an empty table for both is
+worse than no dashboard, because it manufactures confidence.
+
 ## Querying
 
 ### `tls.client.server_name` never aggregates
@@ -405,6 +442,21 @@ couple of minutes and needs no action.
 
 Losing `arkime_stats` costs Arkime's own node-statistics history — the UI graphs.
 Sessions and PCAP live in different indices and are untouched.
+
+### Several checks can restart the same container in one run
+
+The publisher and the mover are different watchers in the SAME container
+(`pcap-monitor`), and the queue-age rule covers the same ground as the
+thread-loss rule. So a run in which both watchers are degraded restarted
+`pcap-monitor` three times in ninety seconds - each restart dropping whatever was
+in flight and re-entering `--start-sleep`, so the third undid whatever the first
+had achieved.
+
+This is the self-inflicted restart loop already documented above, arriving by a
+new route: not a check that fires repeatedly over time, but several checks
+agreeing at the same instant. Restart at most once per service per run and let
+later checks report without acting. `tools/watchdog` tracks which services it has
+already restarted during the current run.
 
 ### A restore test against an empty index proves nothing
 
