@@ -575,6 +575,60 @@ look new and exempt it permanently.
 Session metadata is untouched and keeps its own 90-day retention. Losing a raw
 capture costs the packet bytes for an old session, not the session.
 
+### One oversized capture deadlocks the whole mover
+Symptom: the pipeline stops, `pcap/upload` grows, and the mover **never logs the
+offending file at all** — no `👓`, no error, container healthy. Restarting it
+does not help, because every restart re-encounters the same file and stops
+again. Observed: a 156 MB capture held the pipeline for over an hour; moving
+that one file aside restored flow immediately.
+
+The mechanism is in `watch_common.py`. The queue is ordered, and the drain loop
+calls `fileProcessor(fileName)` **synchronously, inline**, logging `🖄 processed`
+only after it returns. So a single file that the processor cannot get through
+blocks every file behind it, and the log line that would name it is on the far
+side of the call that never returns. Head-of-line, with the evidence suppressed.
+
+`sensor/rotate.sh` therefore refuses to queue them: anything over
+`MAX_PCAP_BYTES` (default 50 MB) is moved to `pcap/quarantine`, which nothing
+polls, and logged. The capture is kept for manual handling rather than deleted —
+the pipeline keeps moving instead of deadlocking on one file.
+
+**`tcpdump -C` is not the alternative.** Size-based rotation appends a numeric
+suffix — `file.pcap1`, `file.pcap2` — which destroys the `.pcap` extension the
+pipeline matches on, so those captures are ignored entirely. Verified, not
+assumed; a naive `-C` makes things silently worse than the problem it fixes.
+
+### Rotation interval and PCAP retention multiply into one number
+They look like independent knobs and are not. Steady-state file count in the
+polled archive is `(86400 / ROTATE_SECS) * PCAP_RETENTION_DAYS`, and both ends
+of that range have a failure mode:
+
+- **Rotate too slowly** and a traffic burst inside one window produces the
+  oversized capture above. Measured at 300s: median 0.9 MB, p95 38 MB, max
+  107 MB, 13 files over 50 MB out of 444.
+- **Rotate too quickly** and the file count explodes, which is what
+  `pcap_watcher` pays for on every poll. Measured cost of a full
+  `scandir`+`stat` on the bind mount is **1.14 ms/entry** (450 entries = 515 ms,
+  reproducible across trials).
+
+| rotate | retention | files | scan per poll |
+|---|---|---|---|
+| 300s | 14d | 4,032 | ~4.6 s |
+| 60s | 14d | 20,160 | ~23 s |
+| 120s | 7d | 5,040 | ~5.8 s |
+
+The settle window (`PCAP_PIPELINE_POLLING_ASSUME_CLOSED_SEC`) is 10 s. Once a
+snapshot takes longer than that, the watcher is late by construction and
+presents exactly like the silent stall below. Change either knob and check the
+product, not the knob.
+
+Note the drain loop itself is **not** the constraint, despite an earlier comment
+in `config.env.example` claiming it processed roughly one file per poll cycle.
+It iterates the whole ordered deck per pass, processes every settled file, and
+breaks only at the first unsettled one, resetting its sleep to 0.5 s. Measured:
+**443 files drained in ~12 seconds** when a backlog cleared. Do not size the
+rotation interval against that myth.
+
 ### The silent watcher stalls: what is known, and what is not
 Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.
 Roughly one every 2-4 hours. `tools/watchdog --heal` contains them with no data

@@ -19,3 +19,6 @@ __pycache__/
 mitm/ca/
 *.ndjson
 .mitm-flows.tmp
+
+# Session handoff notes: real network evidence, local only.
+docs/HANDOFF.md

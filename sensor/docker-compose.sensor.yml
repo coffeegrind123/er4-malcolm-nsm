@@ -24,6 +24,7 @@ services:
       SNAPLEN: "${SNAPLEN}"
       RBUF: "${RBUF}"
       EXTRA_BPF: "${EXTRA_BPF:-}"
+      MAX_PCAP_BYTES: "${MAX_PCAP_BYTES:-52428800}"
     volumes:
       - type: bind
         source: ${KEYS_DIR_WIN}
