@@ -138,6 +138,57 @@ for row in ppl(f"source={INDEX} | where `event.dataset`='alert' | stats count() 
     if row[1] and row[1] != "-":
         print(f"  {row[0]:>6d}  {str(row[1])[:80]}")
 
+head("TLS / certificates")
+# Certificate visibility is NOT a property of your capture - it is a property of
+# the protocol. TLS 1.3 encrypts the Certificate message, so Zeek sees x509 only
+# for 1.2 handshakes. Every cert-based conclusion therefore covers a minority of
+# traffic, and the issuers you can see skew toward older stacks (embedded
+# devices, enterprise telemetry) rather than being representative.
+#
+# Version is not stored as its own field here; the JA4 fingerprint encodes it in
+# characters 2-3 (t13 = TLS 1.3, t12 = TLS 1.2).
+tls = search({
+    "size": 0,
+    "query": {"bool": {"filter": [{"term": {"event.dataset": "ssl"}},
+                                  {"range": {"@timestamp": {"gte": since}}}]}},
+    "aggs": {"ja4": {"terms": {"field": "tls.client.ja4", "size": 200}}},
+})
+vers = {}
+for b in tls.get("aggregations", {}).get("ja4", {}).get("buckets", []):
+    label = {"13": "TLS1.3", "12": "TLS1.2", "11": "TLS1.1", "10": "TLS1.0"}.get(b["key"][1:3], b["key"][1:3])
+    vers[label] = vers.get(label, 0) + b["doc_count"]
+tot = sum(vers.values())
+if tot:
+    print("  versions: " + ", ".join(f"{k}={v} ({100*v/tot:.0f}%)"
+                                     for k, v in sorted(vers.items(), reverse=True)))
+    legacy = vers.get("TLS1.1", 0) + vers.get("TLS1.0", 0)
+    if legacy:
+        print(f"  {legacy} sessions on TLS 1.0/1.1 — deprecated, worth identifying")
+
+certs = search({
+    "size": 0,
+    "query": {"term": {"event.dataset": "x509"}},
+    "aggs": {"iss": {"terms": {"field": "zeek.x509.certificate_issuer.O", "size": 10}},
+             "klen": {"terms": {"field": "zeek.x509.certificate_key_length", "size": 6}},
+             "longlived": {"filter": {"range": {"zeek.x509.certificate_not_valid_after": {"gte": "2030-01-01"}}},
+                           "aggs": {"who": {"terms": {"field": "zeek.x509.certificate_issuer.O", "size": 4}}}}},
+})
+ca = certs.get("aggregations", {})
+if ca.get("iss", {}).get("buckets"):
+    print("  issuers (TLS 1.2 handshakes only):")
+    for b in ca["iss"]["buckets"]:
+        print(f"    {b['doc_count']:>5d}  {b['key']}")
+    weak = [b for b in ca.get("klen", {}).get("buckets", [])
+            if isinstance(b["key"], int) and 1024 <= b["key"] < 2048]
+    print("  key lengths: " + ", ".join(f"{b['key']}={b['doc_count']}"
+                                        for b in ca.get("klen", {}).get("buckets", []))
+          + ("   <-- WEAK RSA present" if weak else ""))
+    ll = ca.get("longlived", {})
+    if ll.get("doc_count"):
+        who = ", ".join(b["key"] for b in ll.get("who", {}).get("buckets", []))
+        print(f"  {ll['doc_count']} certs valid past 2030 ({who}) — private CAs only; "
+              f"public CAs are capped near 398 days")
+
 head("DNS health")
 # Two questions worth asking of DNS, and neither is "what did we look up".
 #

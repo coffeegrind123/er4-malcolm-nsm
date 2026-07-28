@@ -421,3 +421,21 @@ container that does not exist returns no output, which the watchdog reads as
 
 `tools/watchdog` and `tools/osapi` derive it from `basename "$MALCOLM_DIR"`, and
 `COMPOSE_PROJECT` overrides it if you set one explicitly.
+
+### You cannot see certificates for most of your traffic (and that is the protocol)
+TLS 1.3 encrypts the Certificate message. Zeek therefore emits `x509` records
+only for **TLS 1.2** handshakes. Measured here: TLS 1.3 was 66% of sessions and
+contributed **zero** certificate records.
+
+Every conclusion drawn from certificate data covers the 1.2 minority, and the
+issuers you can see skew toward older stacks — embedded devices and enterprise
+telemetry — rather than being representative of the network. "We only have three
+CAs" is an artefact, not a finding.
+
+The same applies more broadly: **this is a passive sensor, not an interception
+proxy.** It sees metadata — who talked to whom, hostnames via SNI and DNS, sizes,
+timing — and full packet *bytes*, but those bytes stay encrypted. Seeing plaintext
+requires either terminating TLS (a MITM proxy plus a CA installed on every
+client, which certificate-pinned devices will refuse) or obtaining session keys
+from the client (`SSLKEYLOGFILE`), which decrypts retroactively because the full
+packets are already on disk.
