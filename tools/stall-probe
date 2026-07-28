@@ -4,6 +4,7 @@
 #   tools/stall-probe start      begin sampling (a tiny --pid=host container)
 #   tools/stall-probe status     is it running, how much has it collected
 #   tools/stall-probe report [m] summarise the last m minutes (default 60)
+#   tools/stall-probe threads    thread census (a dead worker IS the stall)
 #   tools/stall-probe dump       deep one-shot forensics, right now
 #   tools/stall-probe stop       stop sampling
 #
@@ -169,6 +170,53 @@ cmd_dump() {
   echo "$out"
 }
 
+# A thread census. DIAGNOSTIC ONLY - deliberately not wired into the watchdog.
+#
+# Worth reading before trusting thread count as a stall signal, because it looked
+# conclusive and was not. During the first stall whose evidence survived the
+# repair (2026-07-28 18:30) the zeek extractor went from 3 threads to 2 at
+# 18:24:34, which lined up neatly with a queue that had stopped draining.
+#
+# It does not hold up:
+#
+#   - the queue's oldest entry dated from ~18:21:23, BEFORE the thread went
+#   - after the repair the extractor settled back to 2 threads and drained
+#     normally, so 2 is a working steady state, not a wedged one
+#
+# The third thread is transient. A restart-on-low-thread-count rule built from
+# that correlation would fire on a perfectly healthy extractor - which is exactly
+# the self-inflicted restart loop docs/GOTCHAS.md already warns about.
+#
+# What the same forensics DID establish is narrower and still useful: at the
+# moment of that stall no watcher thread was in p9_client_rpc or in state D.
+# They were parked in futex_do_wait and hrtimer_nanosleep. Whatever stopped that
+# queue, it was not a wedged 9p syscall.
+cmd_threads() {
+  docker run --rm --privileged --pid=host alpine sh -c '
+    ps -eo pid,args 2>/dev/null | while read -r pid rest; do
+      case "$rest" in python*) ;; *) continue ;; esac
+      case "$rest" in
+        *pcap_watcher.py*)              role=publisher ;;
+        *watch-pcap-uploads-folder.py*) role=mover ;;
+        *filebeat-watch-zeeklogs*)      role=zeek-extract ;;
+        *) continue ;;
+      esac
+      [ -d "/proc/$pid/task" ] || continue
+      # Seconds since this process started, so a watcher still inside its
+      # --start-sleep is not read as a watcher in trouble.
+      #
+      # starttime is field 22 of /proc/PID/stat, but field 2 is the comm and it
+      # can contain spaces AND parentheses - so a plain $22 lands on the wrong
+      # number and silently reports the host uptime instead of the process age.
+      # Cut after the LAST ")" and count from there.
+      rest=$(sed "s/.*) //" /proc/$pid/stat 2>/dev/null)
+      st=$(echo "$rest" | awk "{print \$20}")
+      boot=$(cut -d. -f1 /proc/uptime)
+      up=$(( boot - st / 100 ))
+      echo "$role $(ls /proc/$pid/task 2>/dev/null | wc -l) ${up:-0}"
+    done' 2>/dev/null
+}
+
 cmd_report() {
   local mins="${1:-60}"
   if ! docker ps -a --format '{{.Names}}' | grep -qx "$PROBE_CONTAINER"; then
@@ -303,6 +351,7 @@ case "${1:-help}" in
   stop)   shift; cmd_stop "$@" ;;
   status) shift; cmd_status "$@" ;;
   report) shift; cmd_report "$@" ;;
+  threads) shift; cmd_threads "$@" ;;
   dump)   shift; cmd_dump "$@" ;;
   help|*) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
 esac

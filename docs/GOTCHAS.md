@@ -928,6 +928,47 @@ Use percentiles, not the mean, when reporting this: one 149 s outlier in 47
 samples drags the mean to 7x the median and manufactures a number that describes
 the spike rather than the system.
 
+### The first stall whose evidence survived the repair - and it was not 9p
+
+Captured 2026-07-28 18:30 by `tools/watchdog` calling `tools/stall-probe dump`
+before healing. `zeek-logs/upload` had 4 tarballs pending, oldest 520 s, and the
+consumer had produced no events.
+
+**What the thread state showed:**
+
+| watcher | threads |
+|---|---|
+| publisher | `hrtimer_nanosleep`, `futex_do_wait` x2, `do_epoll_wait` x2 |
+| mover | `hrtimer_nanosleep`, `futex_do_wait` x2 |
+| zeek-extract | `hrtimer_nanosleep`, `futex_do_wait` |
+
+Not one thread in `p9_client_rpc`. Not one in state `D`. So whatever stopped that
+queue, **it was not a wedged 9p syscall** - which is the leading hypothesis for
+these stalls, and it does not explain this one.
+
+The pcap pipeline was working normally throughout: the mover and publisher both
+handled a capture at 18:29:39 and 18:29:53, seconds before the dump. The stall
+was isolated to the Zeek tarball extractor.
+
+**The red herring, recorded because it was convincing.** The probe history showed
+the extractor running 3 threads steadily for 47 minutes, then dropping to 2 at
+18:24:34 - apparently a worker dying and taking the queue with it. It does not
+survive checking:
+
+- the queue's oldest entry dated from ~18:21:23, **before** the thread went
+- after the repair the extractor settled back to 2 threads and drained normally,
+  so 2 is a working steady state
+
+The third thread is transient. A "restart when the thread count drops" rule built
+from that correlation would fire on a healthy extractor forever - the exact
+self-inflicted restart loop this file already warns about. `tools/stall-probe
+threads` exists as a diagnostic and is deliberately **not** wired into the
+watchdog.
+
+Two lessons worth more than the finding: a correlation that appears at the moment
+of an incident is still only a correlation, and the cheapest test is to ask
+whether the "broken" state is also present when things work.
+
 ### The silent watcher stalls: what is known, and what is not
 Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.
 Roughly one every 2-4 hours. `tools/watchdog --heal` contains them with no data
