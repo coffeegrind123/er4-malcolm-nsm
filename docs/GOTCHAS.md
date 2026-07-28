@@ -481,3 +481,22 @@ tunnel, since macvlan cannot give a Docker Desktop container a LAN presence.
 Hence the Debian base. And install the userspace WireGuard backend in the *same*
 layer as the rest: a separate `RUN ... || true` produced an image with `wg-quick`
 present and no backend at all, which fails at run time instead of build time.
+
+### The observer is in the data, and it is usually the loudest thing there
+Whatever does the monitoring — an agent session, a remote shell, a log shipper —
+egresses from the same network it is watching. Measured on this deployment: an
+agent session accounted for **1.28 GB of 1.63 GB of all upload, 79% of
+everything leaving the network**, across 1075 connections.
+
+Unlabelled, that is the single most alarming row in any volume analysis: a
+massively upload-skewed flow to one external address, running all night. It
+looks exactly like exfiltration, and it is your own tooling.
+
+Set `OBSERVER_DESTS` and `tools/investigate` labels those rows instead of
+ranking them as findings. The same applies to any traffic *caused* by
+monitoring — remote shells, artefact uploads, the capture transport itself
+(already excluded by BPF at the sensor).
+
+More generally: the measurement perturbs the thing measured, and on a quiet home
+network the perturbation can dominate. Establish what your own tooling
+contributes before drawing conclusions about anything else.

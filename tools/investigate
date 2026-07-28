@@ -13,6 +13,7 @@ ports), a persistent flow reuses one. Without that check, every long-running
 TLS session and VPN tunnel is reported as a beacon.
 """
 import json
+import os
 import subprocess
 import statistics as st
 import sys
@@ -120,6 +121,13 @@ vol = search({
                      "aggs": {"up": {"sum": {"field": "client.bytes"}},
                               "down": {"sum": {"field": "server.bytes"}}}}}
 })
+# The observer is in the data. Anything doing the monitoring - an agent session,
+# a remote shell, a log shipper - egresses from the same network it is watching,
+# and its traffic is often the single largest flow present. Measured here: an
+# agent session was 79% of all upload. Left unlabelled that reads as exfiltration
+# and burns an evening chasing it. List those destinations in OBSERVER_DESTS.
+observers = {d.strip() for d in os.environ.get("OBSERVER_DESTS", "").split(",") if d.strip()}
+
 print(f"  {'UP(MB)':>8} {'DOWN(MB)':>9} {'ratio':>7}  destination")
 for b in vol.get("aggregations", {}).get("dst", {}).get("buckets", [])[:14]:
     up = b["up"]["value"] or 0
@@ -127,7 +135,12 @@ for b in vol.get("aggregations", {}).get("dst", {}).get("buckets", [])[:14]:
     if up < 100_000:
         continue
     ratio = up / down if down else float("inf")
-    note = "  <-- upload-heavy" if ratio > 2 else ""
+    if b["key"] in observers:
+        note = "  <-- OBSERVER (your own tooling, not a finding)"
+    elif ratio > 2:
+        note = "  <-- upload-heavy"
+    else:
+        note = ""
     print(f"  {up/1048576:8.1f} {down/1048576:9.1f} {ratio:7.1f}  {b['key']}{note}")
 print("  (resolve names with: tools/osapi ppl \"source=arkime_sessions3-* | where "
       "`destination.ip`='IP' and `event.dataset`='ssl' | stats count() by `server.domain`\")")
