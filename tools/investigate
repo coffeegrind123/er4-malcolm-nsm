@@ -25,35 +25,13 @@ INDEX = "arkime_sessions3-*"
 HOURS = int(sys.argv[1]) if len(sys.argv) > 1 else 3
 
 
-def load_config_env() -> None:
-    """Pull config.env into the environment, as every other tool here does.
+sys.path.insert(0, str(HERE))
+from _config import load_config_env  # noqa: E402
 
-    Without this, OBSERVER_DESTS is inert: config.env.example and GOTCHAS.md
-    both say to set it there, but this script only ever read os.environ, so the
-    setting did nothing unless it happened to be exported by hand. The failure
-    is silent - the observer rows simply stay unlabelled, which is exactly the
-    outcome the setting exists to prevent.
-
-    Real values only ever live in config.env, which is gitignored. Existing
-    environment wins, so an explicit override on the command line still works.
-    """
-    cfg = HERE.parent / "config.env"
-    if not cfg.is_file():
-        return
-    for line in cfg.read_text(encoding="utf-8", errors="ignore").splitlines():
-        line = line.strip()
-        if not line or line.startswith("#") or "=" not in line:
-            continue
-        key, val = line.split("=", 1)
-        key = key.strip()
-        if not key.isidentifier() or key in os.environ:
-            continue
-        val = val.split(" #", 1)[0].strip()
-        if len(val) >= 2 and val[0] == val[-1] and val[0] in "\"'":
-            val = val[1:-1]
-        os.environ[key] = val
-
-
+# config.env carries OBSERVER_DESTS. Reading only os.environ made that setting
+# inert: config.env.example and GOTCHAS both say to set it there, and the
+# observer rows stayed unlabelled anyway - the loudest row in any volume
+# analysis, and the one that reads as exfiltration until it is named.
 load_config_env()
 
 

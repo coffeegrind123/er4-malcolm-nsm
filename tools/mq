@@ -9,6 +9,8 @@
 # is mapped as text and silently returns zero buckets rather than an error.
 set -u
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# No config.env load here on purpose: this is a thin wrapper that execs mapi,
+# which loads it. Sourcing it twice would be harmless but misleading.
 
 filter=$(python3 -c "import urllib.parse,sys; print(urllib.parse.quote(sys.argv[1]))" "$1")
 limit="${2:-10}"

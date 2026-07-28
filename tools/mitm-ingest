@@ -23,6 +23,29 @@ from pathlib import Path
 
 HERE = Path(__file__).resolve().parent
 OSAPI = str(HERE / "osapi")
+
+sys.path.insert(0, str(HERE))
+from _config import load_config_env  # noqa: E402
+
+load_config_env()
+
+
+def default_flows_file() -> str:
+    """Where the decrypted-flow NDJSON is read from.
+
+    MITM_NDJSON_HOST is the tool's own knob and wins. Failing that, derive it
+    from MITM_FLOWS_DIR_WIN, which is what config.env actually documents - the
+    two names describe the same thing, so setting the documented one and having
+    the tool silently read /tmp instead is the sort of gap that only surfaces
+    once someone turns interception on and finds no flows arriving.
+    """
+    explicit = os.environ.get("MITM_NDJSON_HOST")
+    if explicit:
+        return explicit
+    flows_dir = os.environ.get("MITM_FLOWS_DIR_WIN") or os.environ.get("MITM_FLOWS_DIR")
+    if flows_dir:
+        return str(Path(flows_dir) / "flows.ndjson")
+    return "/tmp/mitm-flows.ndjson"
 STATE = Path(os.environ.get("MITM_INGEST_STATE", "/tmp/er4-mitm-ingest.offset"))
 INDEX_PREFIX = "mitm-flows"
 
@@ -83,8 +106,7 @@ def ship(lines: list) -> int:
 
 def main() -> int:
     ap = argparse.ArgumentParser()
-    ap.add_argument("--file", default=os.environ.get(
-        "MITM_NDJSON_HOST", "/tmp/mitm-flows.ndjson"))
+    ap.add_argument("--file", default=default_flows_file())
     ap.add_argument("--once", action="store_true")
     args = ap.parse_args()
 
