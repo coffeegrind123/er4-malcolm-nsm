@@ -1,0 +1,118 @@
+#!/usr/bin/env bash
+# Put quarantined captures back through the pipeline.
+#
+#   tools/unquarantine --dry-run   what would be re-queued, and how
+#   tools/unquarantine             re-queue everything, paced
+#   tools/unquarantine --keep      re-queue but do not delete the originals
+#
+# Quarantine was never storage - nothing reads it, nothing analyses it, and its
+# contents are invisible to every query and dashboard. Each file in there is a
+# hole in the record during a traffic burst, which is the worst time to have one.
+#
+# sensor/rotate.sh no longer discards oversized captures (it splits them), so
+# this exists for two reasons: to recover the backlog quarantine already holds,
+# and to handle the one remaining case where rotate.sh still quarantines - a
+# capture it could not split at all.
+#
+# PACING MATTERS. Dropping several hundred MB into pcap/upload at once gives the
+# mover a backlog deeper than a normal rotation ever produces, and a deep queue
+# is indistinguishable from a stalled one to the watchdog - which would then
+# "heal" a pipeline that is merely busy. Files go in one at a time and wait for
+# the queue to drain.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/_config.sh"
+
+PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+MAX_BYTES="${MAX_PCAP_BYTES:-268435456}"
+SPLIT_MB="${PCAP_SPLIT_MB:-100}"
+SENSOR_IMAGE="${SENSOR_IMAGE:-er4-sensor}"
+QUEUE_MAX="${UNQUARANTINE_QUEUE_MAX:-2}"
+WAIT_MAX="${UNQUARANTINE_WAIT_SECS:-300}"
+
+DRY=0; KEEP=0
+for a in "$@"; do
+  case "$a" in
+    --dry-run) DRY=1 ;;
+    --keep)    KEEP=1 ;;
+  esac
+done
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+
+inmount() { docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c "$1" 2>/dev/null; }
+# Splitting needs tcpdump, which the sensor image already carries - so this adds
+# no image and no download.
+insensor() { docker run --rm --entrypoint sh -v "${PCAP_MOUNT}:/pcap" "$SENSOR_IMAGE" -c "$1" 2>&1; }
+
+wait_for_queue() {
+  local waited=0 n
+  while :; do
+    n=$(inmount 'ls -1 /p/upload/*.pcap 2>/dev/null | wc -l')
+    [[ "${n:-0}" -le "$QUEUE_MAX" ]] && return 0
+    [[ "$waited" -ge "$WAIT_MAX" ]] && { warn "upload queue still at ${n} after ${waited}s - continuing anyway"; return 0; }
+    sleep 10; waited=$((waited + 10))
+  done
+}
+
+files=$(inmount 'ls -1 /p/quarantine/*.pcap 2>/dev/null | xargs -r -n1 basename')
+if [[ -z "$files" ]]; then
+  say "quarantine is empty - nothing to recover"
+  exit 0
+fi
+
+say "quarantined captures$( [[ $DRY -eq 1 ]] && echo '  (dry run)')"
+while read -r name; do
+  [[ -n "$name" ]] || continue
+  size=$(inmount "stat -c %s /p/quarantine/${name}")
+  mb=$(( size / 1048576 ))
+
+  if [[ "$size" -le "$MAX_BYTES" ]]; then
+    echo "    ${name}  ${mb} MB  -> re-queue whole"
+    [[ $DRY -eq 1 ]] && continue
+    wait_for_queue
+    inmount "mv /p/quarantine/${name} /p/upload/${name}" \
+      && ok "queued ${name}" || warn "could not queue ${name}"
+  else
+    echo "    ${name}  ${mb} MB  -> split into ~${SPLIT_MB} MB parts, then re-queue"
+    [[ $DRY -eq 1 ]] && continue
+    wait_for_queue
+    base="${name%.pcap}"
+    out=$(insensor "
+      mkdir -p /pcap/.split && rm -f /pcap/.split/${base}*
+      tcpdump -r /pcap/quarantine/${name} -w /pcap/.split/${base} -C ${SPLIT_MB} 2>/dev/null || exit 1
+      n=0
+      # The first chunk has NO numeric suffix - glob with a bare * or lose it.
+      for c in /pcap/.split/${base}*; do
+        [ -f \"\$c\" ] || continue
+        n=\$((n+1))
+        mv \"\$c\" /pcap/upload/${base}-p\${n}.pcap
+      done
+      echo \$n")
+    n=$(tail -1 <<<"$out")
+    if [[ "${n:-0}" -gt 0 ]]; then
+      ok "split ${name} into ${n} parts and queued them"
+      if [[ $KEEP -eq 0 ]]; then
+        inmount "rm -f /p/quarantine/${name}"
+        echo "      original removed - the packets now live in the parts, under the normal PCAP retention"
+      fi
+    else
+      warn "could not split ${name} - left in quarantine"
+      echo "      ${out}" | tail -2 | sed 's/^/      /'
+    fi
+  fi
+done <<<"$files"
+
+if [[ $DRY -eq 1 ]]; then
+  say "dry run - nothing moved"
+  exit 0
+fi
+
+say "done"
+inmount 'echo "    quarantine now: $(ls -1 /p/quarantine/*.pcap 2>/dev/null | wc -l) file(s)"
+         echo "    upload queue:   $(ls -1 /p/upload/*.pcap 2>/dev/null | wc -l) pending"'
+echo
+echo "    Confirm they were analysed rather than just moved:"
+echo "      tools/osapi es POST arkime_files/_search '{\"size\":0,\"track_total_hits\":true,\"query\":{\"wildcard\":{\"name\":\"*<name>*\"}}}'"

@@ -1,0 +1,162 @@
+#!/usr/bin/env bash
+# Measure what the pipeline can actually swallow, instead of guessing at it.
+#
+#   tools/pcap-limit                 size distribution, the cap, and what it costs
+#   tools/pcap-limit probe <file>    feed one quarantined capture back through the
+#                                    pipeline, attended, with an automatic abort
+#
+# WHY
+#
+# MAX_PCAP_BYTES (50 MB) was set from one data point: a 156 MB capture wedged the
+# mover for over an hour. Everything between "38 MB is fine" and "156 MB is fatal"
+# was unmeasured, and the cap has been sitting in the middle of that gap
+# discarding real traffic - including a 51.0 MB capture that was 1 MB over the
+# line. Every quarantined capture is a hole in the busiest traffic there is,
+# because bursts are exactly what makes a file large.
+#
+# HOW THIS IS SAFE TO RUN ON A LIVE PIPELINE
+#
+# The failure being tested is a HEAD-OF-LINE block: the drain loop holds the deck
+# lock across fileProcessor(), so one file that cannot be got through stops every
+# file behind it. The probe therefore:
+#
+#   - feeds ONE file and watches it specifically
+#   - aborts by pulling the file back out, which is the documented repair
+#   - aborts at ABORT_SECS (default 180) - deliberately shorter than the
+#     watchdog's STALL_SECS (420), so the experiment finishes before the healer
+#     starts restarting containers underneath it
+#
+# so the worst case is a few minutes of ingest latency, not an outage.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/_config.sh"
+
+PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+MONITOR_CONTAINER="${MONITOR_CONTAINER:-${COMPOSE_PROJECT}-pcap-monitor-1}"
+ABORT_SECS="${PCAP_PROBE_ABORT_SECS:-180}"
+MAX_BYTES="${MAX_PCAP_BYTES:-52428800}"
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+die()  { printf '    \033[31mfail\033[0m %s\n' "$*" >&2; exit 1; }
+
+inmount() { docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c "$1" 2>/dev/null; }
+
+cmd_status() {
+  say "capture size distribution (processed/)"
+  # The distribution is the argument. A cap only costs data where the histogram
+  # has mass above it, and this prints exactly that.
+  inmount '
+    for f in /p/processed/*.pcap; do [ -f "$f" ] || continue; stat -c %s "$f"; done' \
+  | sort -n | awk -v cap="$MAX_BYTES" '
+      { s[NR]=$1; total+=$1 }
+      END {
+        if (NR==0) { print "    no captures"; exit }
+        printf "    %d captures, %.1f GB total\n", NR, total/1073741824
+        printf "    median %.1f MB   p95 %.1f MB   p99 %.1f MB   max %.1f MB\n",
+               s[int(NR*0.50)+0]/1048576, s[int(NR*0.95)+0]/1048576,
+               s[int(NR*0.99)+0]/1048576, s[NR]/1048576
+        for (i=1;i<=NR;i++) if (s[i] > cap) over++
+        printf "    %d of %d (%.2f%%) would exceed the current cap of %d MB\n",
+               over+0, NR, 100*(over+0)/NR, cap/1048576
+      }'
+
+  say "quarantine (captures the cap has already discarded)"
+  inmount '
+    for f in /p/quarantine/*.pcap; do [ -f "$f" ] || continue
+      printf "    %8.1f MB  %s\n" "$(stat -c %s "$f")e-6" "$(basename "$f")"
+    done' | sed 's/e-6//' \
+  || true
+  inmount 'ls -1 /p/quarantine/*.pcap 2>/dev/null | wc -l' | \
+    xargs -I{} echo "    {} quarantined capture(s); each one is a blind spot during a traffic burst"
+}
+
+cmd_probe() {
+  local name="${1:-}"
+  [[ -z "$name" ]] && die "usage: tools/pcap-limit probe <filename-in-quarantine>"
+  name="$(basename "$name")"
+
+  local size
+  size=$(inmount "stat -c %s /p/quarantine/${name} 2>/dev/null")
+  [[ -z "$size" ]] && die "no such capture in quarantine: ${name}"
+
+  say "probing ${name} ($(( size / 1048576 )) MB, cap is $(( MAX_BYTES / 1048576 )) MB)"
+  echo "    abort after ${ABORT_SECS}s (watchdog STALL_SECS is ${STALL_SECS:-420}, so this finishes first)"
+
+  # Baseline: how many files are queued, and where the consumers are. If the
+  # probe file wedges the mover, everything BEHIND it stops too - and that
+  # difference is what separates "slow" from "head-of-line blocked". Without
+  # this control a slow-but-working file reads as a wedge.
+  local up0 proc0
+  up0=$(inmount 'ls -1 /p/upload/*.pcap 2>/dev/null | wc -l')
+  proc0=$(inmount 'ls -1 /p/processed/*.pcap 2>/dev/null | wc -l')
+  ok "before: upload=${up0} processed=${proc0}"
+
+  local t0; t0=$(date -u +%s)
+  inmount "mv /p/quarantine/${name} /p/upload/${name}" || die "could not move the capture into upload/"
+  ok "queued at $(date -u +%H:%M:%SZ)"
+
+  local seen_watch=0 seen_move=0 seen_pub=0 moved_at=0 pub_at=0 elapsed=0
+  while :; do
+    sleep 5
+    elapsed=$(( $(date -u +%s) - t0 ))
+
+    # Has the mover taken it out of upload/?
+    if [[ "$seen_move" -eq 0 ]] && ! inmount "test -f /p/upload/${name} && echo yes" | grep -q yes; then
+      seen_move=1; moved_at=$elapsed
+      ok "mover took it after ${moved_at}s"
+    fi
+
+    local logs
+    logs=$(docker logs --since "$((elapsed + 30))s" "$MONITOR_CONTAINER" 2>&1 | grep -F "$name" || true)
+    [[ "$seen_watch" -eq 0 ]] && grep -q '👓' <<<"$logs" && { seen_watch=1; ok "mover logged it (👓) at ${elapsed}s"; }
+    if [[ "$seen_pub" -eq 0 ]] && grep -q '📫' <<<"$logs"; then
+      seen_pub=1; pub_at=$elapsed
+      ok "publisher announced it (📫) after ${pub_at}s - the analysers have it"
+      break
+    fi
+
+    # Did everything else keep flowing? This is the control.
+    local up1 drained
+    up1=$(inmount 'ls -1 /p/upload/*.pcap 2>/dev/null | wc -l')
+    drained=$(docker logs --since 2m "$MONITOR_CONTAINER" 2>&1 | grep -cE '🖅|📫' || true)
+
+    if [[ "$elapsed" -ge "$ABORT_SECS" ]]; then
+      warn "no publish after ${elapsed}s - aborting"
+      echo "      upload queue: ${up0} -> ${up1}, consumer events in the last 2m: ${drained}"
+      if [[ "$seen_move" -eq 0 ]]; then
+        inmount "mv /p/upload/${name} /p/quarantine/${name}" \
+          && ok "pulled it back to quarantine - the pipeline is unblocked"
+      else
+        warn "it left upload/ but was never published; it is in processed/ and will be re-announced or re-queued by the watchdog"
+      fi
+      say "RESULT: ${name} ($(( size / 1048576 )) MB) did NOT clear the pipeline in ${ABORT_SECS}s"
+      if [[ "${drained:-0}" -eq 0 ]]; then
+        echo "    Nothing else drained either - that is a head-of-line block."
+        echo "    The real ceiling is BELOW $(( size / 1048576 )) MB. Keep MAX_PCAP_BYTES under it"
+        echo "    and let tools/unquarantine split anything larger."
+      else
+        echo "    Other files kept moving (${drained} events), so this is slow, not wedged."
+        echo "    A larger ABORT_SECS may well see it complete."
+      fi
+      return 1
+    fi
+  done
+
+  say "RESULT: ${name} ($(( size / 1048576 )) MB) cleared the pipeline"
+  echo "    mover:     ${moved_at}s"
+  echo "    published: ${pub_at}s"
+  echo
+  echo "    A capture $(( size / 1048576 )) MB is $(( (size - MAX_BYTES) / 1048576 )) MB over the current cap and processed fine."
+  echo "    Raise MAX_PCAP_BYTES above $(( size / 1048576 )) MB, then probe the next size up."
+  return 0
+}
+
+case "${1:-status}" in
+  probe)  shift; cmd_probe "$@" ;;
+  status) cmd_status ;;
+  *)      sed -n '2,7p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac
