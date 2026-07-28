@@ -62,6 +62,36 @@ MEM_LEAD_MINS="${MEM_LEAD_MINS:-30}"
 problems=0
 report() { echo "$*"; problems=$((problems + 1)); }
 
+# A TREND warning is only worth printing if something was actually done about it.
+#
+# This script and tools/memguard fit the same slope independently, seconds apart,
+# so they routinely land either side of MEM_LEAD_MINS - 29 minutes here, 31 there.
+# The result was a warning line with no action beneath it, roughly every twenty
+# minutes, which reads as the tool failing rather than declining. A warning that
+# fires and does nothing is how you teach someone to ignore warnings.
+#
+# So let memguard be the single decision-maker: it re-measures, and it either
+# acts (report the warning and what it did) or finds headroom (stay quiet). The
+# LEVEL checks above are unconditional - at the floor there is nothing to debate.
+trend_warn() {
+  if [[ "$HEAL" -ne 1 ]]; then
+    report "$1"
+    return
+  fi
+  local out plain
+  out="$("${HERE}/memguard" --act 2>&1)"
+  # STRIP ANSI BEFORE MATCHING. memguard colourises its status words, so the
+  # line is "\e[32mok\e[0m   stage 1 (page cache): ..." and a pattern anchored
+  # on "ok" never matches. Getting this wrong fails in the dangerous direction:
+  # the warning goes permanently silent instead of merely being noisy, and a
+  # check that can never fire is worse than the noise it was meant to fix.
+  plain="$(sed 's/\x1b\[[0-9;]*m//g' <<<"$out")"
+  if grep -qE '(ok|warn)[[:space:]]+stage [123]' <<<"$plain"; then
+    report "$1"
+    sed -n 's/^    /  /p' <<<"$plain"
+  fi
+}
+
 # Memory is delegated to tools/memguard, which keeps the sample history a trend
 # needs. The check here used to be level-only against MemAvailable, and on this
 # host that cannot be an early warning: routine load floors at ~1557 MB and the
@@ -101,15 +131,9 @@ if [[ -r /proc/meminfo && -x "${HERE}/memguard" ]]; then
       "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
     fi
   elif [[ "${mem_eta:--1}" -ge 0 && "${mem_eta}" -le "$MEM_LEAD_MINS" ]]; then
-    report "MEMORY FALLING (${mem_avail}MB available, projected to reach ${MEM_WARN_MB}MB in ~${mem_eta} min) - act now, not at the floor"
-    if [[ "$HEAL" -eq 1 ]]; then
-      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
-    fi
+    trend_warn "MEMORY FALLING (${mem_avail}MB available, projected to reach ${MEM_WARN_MB}MB in ~${mem_eta} min) - act now, not at the floor"
   elif [[ "${free_eta:--1}" -ge 0 && "${free_eta}" -le "$MEM_LEAD_MINS" ]]; then
-    report "FREE MEMORY FALLING (${mem_free}MB free, projected to reach ${MEM_FREE_WARN_MB}MB in ~${free_eta} min)"
-    if [[ "$HEAL" -eq 1 ]]; then
-      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
-    fi
+    trend_warn "FREE MEMORY FALLING (${mem_free}MB free, projected to reach ${MEM_FREE_WARN_MB}MB in ~${free_eta} min)"
   elif [[ "${swap_pct:-0}" -ge "$SWAP_WARN_PCT" ]]; then
     report "SWAP PRESSURE (${swap_pct}% of swap in use, ${mem_avail}MB available) - a flush failing here corrupts a shard irrecoverably"
   else
