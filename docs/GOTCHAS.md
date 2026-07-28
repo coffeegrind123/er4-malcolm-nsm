@@ -268,6 +268,59 @@ with no error even though documents plainly carry the field. Use
 
 ### A `-` bucket means "field absent", not a value.
 
+### "CorruptIndexException" usually means the host ran out of memory
+A red cluster with `ALLOCATION_FAILED` and `CorruptIndexException` reads as disk
+corruption. Read the whole nested exception before believing that:
+
+```
+FlushFailedEngineException[Flush failed];
+  nested: CorruptIndexException[Hit unexpected exception while reading segment infos];
+  nested: FileSystemException[/usr/share/opensearch/data/.../index: Cannot allocate memory];
+```
+
+The innermost cause is `Cannot allocate memory`. Lucene could not read its
+segment infos because the *host* had no memory to do it with, and reports that
+as corruption. Measured at the time: 143 MB free, 13.5 GB of 16 GB swap in use.
+Disk was 16% of 9 TB and `vm.max_map_count` was 1048576 — neither was involved.
+
+Check in this order before touching the shard: `free -m`, then the innermost
+`nested:` clause, then disk, then `vm.max_map_count`.
+
+**Do not retry the allocation while the cause is still live.** A shard gets five
+allocation attempts, and under memory pressure it burns all five within seconds
+and then refuses further attempts:
+
+```
+max_retry -> shard has exceeded the maximum number of retries [5]
+```
+
+You then need `POST /_cluster/reroute?retry_failed=true` just to get back to
+where you were. Fix the memory first; retry second.
+
+**`allocate_empty_primary` does not skip corrupt on-disk files.** It still opens
+the existing shard directory, so it fails the same way:
+`IndexShardRecoveryException[failed to fetch index version after copying it
+over]`. When the files are unreadable, the index has to be deleted and recreated.
+
+**Deleting an index races the application that writes it.** With
+`action.auto_create_index: true` (the default), Arkime recreated a plain
+`arkime_stats` index within seconds of the delete — which then blocked the alias,
+because an index and an alias cannot share a name:
+
+```
+invalid_alias_name_exception: Invalid alias name [arkime_stats],
+an index exists with the same name as the alias
+```
+
+Arkime's schema is a versioned index plus an alias (`arkime_stats_v30` +
+`arkime_stats`), and the auto-created one is neither. Capture the mappings and
+settings first, `docker pause` the writer, then delete/recreate/alias and
+unpause. Pausing trips the container healthcheck; it clears on its own within a
+couple of minutes and needs no action.
+
+Losing `arkime_stats` costs Arkime's own node-statistics history — the UI graphs.
+Sessions and PCAP live in different indices and are untouched.
+
 ### An NXDOMAIN leaderboard cannot see the worst name-resolution failures
 "Names that do not exist, asked repeatedly" is the right question, but counting
 `rcode_name: NXDOMAIN` answers only half of it. When a lookup fails, the OS falls
