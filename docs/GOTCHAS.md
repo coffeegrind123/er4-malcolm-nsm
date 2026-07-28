@@ -180,6 +180,30 @@ Check for drain activity before restarting anything: if the consumer has logged
 extract/publish events recently, it is working — report the backlog and leave it
 alone. Only restart when the queue is old **and** nothing is draining.
 
+### A restart loop that can never succeed
+The worst version of the created-events trap, and it was self-inflicted by the
+watchdog rather than by Malcolm.
+
+If a spool directory holds files that were **already there** when its watcher
+started, the watcher ignores them permanently. A restart does not help: to the
+restarted watcher they are still pre-existing. So drain stays at zero, the
+"consumer produced no events" check fires again, and it restarts again — every
+five minutes, forever, while new files pile up behind the stranded ones.
+
+Observed live: five captures stranded from 10:05, repeated restarts of
+`pcap-monitor` and `filebeat` across forty minutes, ingestion falling to zero,
+and every restart making no difference because the problem was never the process.
+
+**Restart once, then escalate.** If drain is still zero after a recent restart,
+the files are stranded, not the process — re-queue them instead. `tools/watchdog`
+records a per-queue restart timestamp and switches to a re-queue if the previous
+restart did not restore drain within `RESTART_ESCALATE_SECS` (default 900).
+
+The diagnostic that separates the two, when it happens to you: compare the
+newest file in the *source* directory against the newest in the *destination*.
+Capture landing at 10:40 while `processed/` stops at 10:05 means the mover is
+the problem. Capture itself stopping means it is not.
+
 ### A stuck head has two causes needing opposite repairs
 Check "is the consumer emitting anything at all" **before** "has the head
 moved", or you will apply the wrong repair:

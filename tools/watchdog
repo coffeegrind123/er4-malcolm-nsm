@@ -86,6 +86,20 @@ fi
 # Depth alone is a bad signal: a deep queue that is moving is fine. The age of
 # the OLDEST pending item is the honest one - if nothing has drained the head of
 # the queue in STALL_SECS, that stage is stuck.
+# Move files out of a spool directory and back, so the watcher sees them as
+# newly created. This is the ONLY thing that clears the created-events trap - a
+# restart leaves them just as pre-existing as before.
+requeue() { # requeue <mount> <glob-dir>
+  local mount="$1" dir="$2" parent
+  parent="$(dirname "$dir")"
+  docker run --rm -v "${mount}:/q" alpine sh -c \
+    "mkdir -p /q/.requeue
+     for f in /q/${dir}; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/.requeue/ 2>/dev/null; done
+     sleep 20
+     for f in /q/.requeue/*; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/${parent}/ 2>/dev/null; done
+     rmdir /q/.requeue 2>/dev/null; true" >/dev/null 2>&1
+}
+
 check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
   local label="$1" mount="$2" dir="$3" svc="$4"
   local oldest count
@@ -128,10 +142,35 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
   # mover had silently stopped for the third time, and re-queuing was a no-op
   # because nothing was left to notice the new files.)
   if [[ "${drained:-0}" -eq 0 ]]; then
+    # A restart only helps a genuinely wedged watcher. If the queue holds files
+    # that were ALREADY there when it started, the restarted watcher treats them
+    # as pre-existing and ignores them exactly as the old one did - so drain
+    # stays 0, this fires again, and it restarts forever without ever making
+    # progress. Observed live: five captures stranded through repeated restarts
+    # while new ones piled up behind them.
+    #
+    # So restart once, then escalate. If drain is still 0 after a recent
+    # restart, the problem is the files, not the process.
+    local rstate="${STATE_DIR}/$(echo "$label" | tr '/' '_').restarted"
+    local last_restart=0
+    [[ -f "$rstate" ]] && last_restart=$(cat "$rstate" 2>/dev/null || echo 0)
+    local since_restart=$(( $(date -u +%s) - last_restart ))
+
+    if [[ "$last_restart" -gt 0 && "$since_restart" -lt "${RESTART_ESCALATE_SECS:-900}" ]]; then
+      report "QUEUE STALLED: ${label} (${count} pending, ${age}s old; restart ${since_restart}s ago did not help - files are stranded, not the process)"
+      if [[ "$HEAL" -eq 1 ]]; then
+        echo "  healing: re-queuing (restart cannot clear pre-existing files)"
+        requeue "$mount" "$dir"
+        : > "$rstate"   # clear, so a genuine wedge can still earn a restart later
+      fi
+      return 0
+    fi
+
     report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, consumer produced no events)"
     if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
       echo "  healing: restarting ${svc}"
       (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
+      date -u +%s > "$rstate"
     fi
     return 0
   fi
@@ -153,12 +192,7 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
     # restarted watcher. Re-present them as new instead.
     if [[ "$HEAL" -eq 1 ]]; then
       echo "  healing: re-queuing stranded entries in ${label}"
-      docker run --rm -v "${mount}:/q" alpine sh -c \
-        "mkdir -p /q/.requeue
-         for f in /q/${dir}; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/.requeue/ 2>/dev/null; done
-         sleep 20
-         for f in /q/.requeue/*; do [ -f \"\$f\" ] || continue; mv \"\$f\" /q/$(dirname "$dir")/ 2>/dev/null; done
-         rmdir /q/.requeue 2>/dev/null; true" >/dev/null 2>&1
+      requeue "$mount" "$dir"
       echo "  re-queued - watchers see them as new files now"
     fi
     return 0
