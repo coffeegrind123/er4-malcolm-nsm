@@ -82,26 +82,42 @@ def search(body: dict) -> dict:
 
 since = f"now-{HOURS}h"
 
+# These three sections used PPL, which has no time filter here - so they counted
+# the ENTIRE index while the heading claimed "last N hours". The failure is
+# silent and badly misleading: on a ~20h corpus the "last 1h" DNS count read
+# 241,352 when the true hourly figure was 14,369, which looks exactly like a DNS
+# storm and invites an investigation into a problem that does not exist.
+#
+# Everything else in this script filters via an ES range query, and that pattern
+# demonstrably works. Use it here too rather than fighting PPL's timestamp
+# handling.
+def terms(field: str, size: int, extra: list | None = None) -> list:
+    filters = [{"range": {"@timestamp": {"gte": since}}}] + (extra or [])
+    d = search({"size": 0,
+                "query": {"bool": {"filter": filters}},
+                "aggs": {"t": {"terms": {"field": field, "size": size}}}})
+    return [(b["doc_count"], b["key"])
+            for b in d.get("aggregations", {}).get("t", {}).get("buckets", [])]
+
+
 head(f"Corpus (last {HOURS}h)")
-for c, ds in sorted(ppl(f"source={INDEX} | stats count() by `event.dataset` | sort - `count()`"),
-                    key=lambda r: -r[0])[:20]:
+for c, ds in terms("event.dataset", 20):
     print(f"  {c:>8d}  {ds}")
 
-head("LAN devices")
-# source.ip is mapped as type `ip`, so PPL's like() rejects it outright
-# ("LIKE function expects STRING, but got IP"). cidrmatch is the IP-typed
-# equivalent; without it this list silently fills up with external peers.
-lan = " or ".join(f"cidrmatch(`source.ip`, '{c}')"
-                  for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
-for row in ppl(f"source={INDEX} | where {lan} | stats count() by `source.ip` "
-               f"| sort - `count()` | head 15"):
-    print(f"  {row[0]:>8d}  {row[1]}")
+head(f"LAN devices (last {HOURS}h)")
+# source.ip is mapped as type `ip`. A term query on an ip field accepts CIDR
+# directly - the ES-side equivalent of the cidrmatch() this used to need in PPL.
+# Without the restriction the list silently fills up with external peers.
+lan = [{"bool": {"should": [{"term": {"source.ip": c}}
+                            for c in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16")],
+                 "minimum_should_match": 1}}]
+for c, ip in terms("source.ip", 15, lan):
+    print(f"  {c:>8d}  {ip}")
 
-head("Top TLS destinations (SNI)")
-for row in ppl(f"source={INDEX} | where `event.dataset`='ssl' | stats count() by `server.domain` "
-               f"| sort - `count()` | head 20"):
-    if row[1] and row[1] != "-":
-        print(f"  {row[0]:>6d}  {row[1]}")
+head(f"Top TLS destinations (SNI) (last {HOURS}h)")
+for c, dom in terms("server.domain", 20, [{"term": {"event.dataset": "ssl"}}]):
+    if dom and dom != "-":
+        print(f"  {c:>6d}  {dom}")
 
 head(f"Periodicity — beacons vs long-lived flows (last {HOURS}h)")
 agg = search({

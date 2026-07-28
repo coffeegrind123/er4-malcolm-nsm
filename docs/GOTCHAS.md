@@ -268,6 +268,30 @@ with no error even though documents plainly carry the field. Use
 
 ### A `-` bucket means "field absent", not a value.
 
+### A time-windowed heading over an unfiltered query
+`tools/investigate` printed `Corpus (last 1h)` above a PPL query that carried no
+time filter at all, so it counted the **entire index** under a heading claiming
+one hour. Nothing errors; the number is just silently wrong, and wrong in the
+direction that manufactures alarm.
+
+Measured: the "last 1h" DNS count read **241,352** against a ~20-hour corpus.
+The true hourly figure was **14,369** — about 4/s, entirely normal — but 241k in
+an hour is ~67/s, which reads as a DNS storm and invites an investigation into a
+problem that does not exist. This repo has a real DNS-storm finding in its
+history, which makes the false positive that much more convincing.
+
+The tell is cheap: **change the window and see whether the number moves.** If
+`investigate 1` and `investigate 24` agree, the filter is not being applied.
+
+```sh
+tools/investigate 1  | sed -n '/Corpus/,/^$/p'
+tools/investigate 24 | sed -n '/Corpus/,/^$/p'   # must differ
+```
+
+The ES-DSL sections filtered correctly the whole time; only the PPL ones did
+not. Fixed by moving those aggregations to the same `range` filter the rest of
+the script already used, rather than fighting PPL's timestamp handling.
+
 ### `from`/`to` parsing is unreliable — always run a control
 Absolute timestamps can be offset. Before reading "0 results" as "this did not
 happen", re-run without the filter to confirm the window contains data at all.
