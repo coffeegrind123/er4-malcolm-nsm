@@ -273,6 +273,70 @@ healthy — is invisible to `docker compose ps`, and costs you every packet
 captured until someone notices the graphs are flat. See
 [GOTCHAS.md](GOTCHAS.md).
 
+Every run also records a memory sample and, before any repair, writes a
+forensics dump of the stalled watcher to `${TMPDIR:-/tmp}/er4-watchdog/forensics/`.
+Collect before you heal, or every incident stays unexplained.
+
+## Snapshots — the thing that makes an index loss survivable
+
+An OOM-corrupted index **cannot be repaired**: `allocate_empty_primary` still
+opens the corrupt files, so the only exit is to delete it. Losing
+`arkime_stats_v30` that way cost the UI graphs. The same event against a session
+index costs the sessions.
+
+```sh
+tools/snapshot init      # register the repository + daily policy (once)
+tools/snapshot list      # what exists, how big, how old
+tools/snapshot verify    # PROVE a snapshot restores, without touching live data
+tools/snapshot take      # snapshot now (refuses to run under memory pressure)
+```
+
+`verify` is the one to run periodically. It restores the newest snapshot into a
+`restore-check-*` index alongside the live data, compares document counts, and
+deletes the copy — so "we have backups" is a measurement rather than a belief.
+
+To actually recover, after deleting the corrupt index:
+
+```sh
+tools/osapi es DELETE arkime_sessions3-260728          # the corrupt one
+tools/snapshot restore <snapshot-name> arkime_sessions3-260728
+tools/osapi es GET _cat/aliases/arkime_sessions3       # confirm the alias came back
+```
+
+This costs no memory, no JVM and no new process: the repository lives under
+Malcolm's existing `path.repo` mount and OpenSearch's own job scheduler runs it.
+
+## Memory pressure — `MEMORY FALLING`, `MEMORY FREE LOW`, `MEMORY LOW`
+
+```sh
+tools/memguard           # state, trend, largest consumers, and what it would do
+tools/memguard --act     # run the mitigation ladder as far as the state warrants
+```
+
+Three warnings, in the order you want to meet them:
+
+| warning | meaning |
+|---|---|
+| `MEMORY FALLING` | still comfortable, but the trend crosses the floor within `MEM_LEAD_MINS` |
+| `MEMORY FREE LOW` | `MemFree` is low even though `MemAvailable` looks fine — one slow reclaim from failing |
+| `MEMORY LOW` | at the floor; this is the state that destroyed an index |
+
+The ladder, each rung reporting the memory it actually reclaimed:
+
+1. **drop the Docker VM page cache** — typically frees 1-3 GB instantly. Not free
+   of charge: everything re-read afterwards comes back over 9p.
+2. **clear OpenSearch caches and flush the translog** — gives heap back and
+   reduces what is in flight if the host does fall over.
+3. **stop logstash** — last resort. It is both the largest sheddable consumer
+   (~2-3 GB) and the source of the writes that make a flush fail. Captures keep
+   landing on disk and filebeat holds its position, so nothing is lost; the cost
+   is ingest latency. `tools/watchdog` restarts it automatically once there is
+   real headroom.
+
+None of this fixes the underlying problem, which is that the collector shares a
+host with heavy compute jobs. `tools/memguard` prints the largest consumers so
+that argument can be made with numbers.
+
 ### `MEMORY LOW` / `SWAP PRESSURE`
 
 Act on these before anything else, and **do not restart your way out of them**.
@@ -314,14 +378,39 @@ tools/prune-pcap --dry-run          # reports quarantine footprint on every run
 docker logs er4-sensor | grep quarantined
 ```
 
-Check it occasionally. A steady trickle means `ROTATE_SECS` is too long for your
-burst traffic and you are silently dropping the most interesting captures; a
-sudden jump means something unusual happened on the network. To analyse one, move
-it back into `pcap/upload/` and watch — if it wedges the mover, `tools/watchdog
---heal` recovers it.
+**Quarantine should now be empty almost always.** Captures over `MAX_PCAP_BYTES`
+are split into `PCAP_SPLIT_MB` pieces and queued, not set aside — the only thing
+that still lands here is a capture `tcpdump` could not read at all. Files
+accumulating is therefore a finding, not routine.
+
+```sh
+tools/pcap-limit                    # size distribution, and what the cap costs
+tools/unquarantine --dry-run        # what would be recovered, and how
+tools/unquarantine                  # re-queue it all, paced
+```
+
+If you need to re-test the ceiling — for instance after changing `ROTATE_SECS` —
+`tools/pcap-limit probe <file>` feeds one capture back through the live pipeline
+attended, aborts by pulling it out again if it does not clear, and does so well
+inside the watchdog's `STALL_SECS` so the healer does not start restarting
+containers underneath the experiment.
 
 Quarantine has its own retention (`QUARANTINE_RETENTION_DAYS`, default 30 days —
 longer than the routine archive, because these are rare and kept deliberately).
+
+## Is the pipeline late because the filesystem is slow?
+
+```sh
+tools/stall-probe start      # sample every watcher's kernel wait channel
+tools/stall-probe report     # 9p latency percentiles vs the settle window
+tools/stall-probe dump       # deep forensics right now
+```
+
+The number to watch is a directory scan of `pcap/processed` against
+`PCAP_PIPELINE_POLLING_ASSUME_CLOSED_SEC` (10 s). Once a scan takes longer than
+the settle window the watcher is late by construction and it looks exactly like a
+silent stall. Scan cost is linear in file count, so it worsens as the archive
+fills toward its retention steady state — `report` projects both.
 
 ## Reading the upload leaderboard
 

@@ -268,6 +268,56 @@ with no error even though documents plainly carry the field. Use
 
 ### A `-` bucket means "field absent", not a value.
 
+### MemAvailable can look healthy while the host is one slow reclaim from failing
+
+`MemAvailable` counts page cache as if it were already yours. Measured here:
+
+```
+MemFree  546 MB   MemAvailable 6,590 MB      <- reads as fine
+after dropping the Docker VM page cache:
+MemFree 5,907 MB  MemAvailable 6,662 MB      <- available barely moved
+```
+
+A check watching only `MemAvailable` cannot see that state at all. It matters
+more on this deployment than it would elsewhere, because the cache being
+reclaimed is backing a 9p mount 60-100x slower than local disk - so the reclaim
+is slow, and an allocation that cannot wait for a slow reclaim is precisely what
+fails and gets reported as a corrupt index.
+
+Watch both. `tools/memguard` does, and its first mitigation rung converts cache
+straight into free memory:
+
+```sh
+docker run --rm --privileged alpine sh -c 'sync; echo 3 > /proc/sys/vm/drop_caches'
+```
+
+It has to run inside a privileged container: Docker Desktop's VM is a different
+kernel from the WSL distro, and that is where the containers' page cache lives.
+Measured effect on a live host: MemFree 898 MB -> 3,855 MB. It is not free of
+charge - everything re-read afterwards comes back over 9p - so it is a
+pressure-relief valve, not something to run on a timer.
+
+### A level threshold cannot be an early warning when the margin is 190 MB
+
+Routine operation here floors at ~1,557 MB available; the corruption incident
+happened at 1,369 MB. Any level trigger placed in that gap either fires
+constantly or fires too late, and no amount of tuning fixes it - the margin is
+the problem.
+
+What does work is the **trajectory**. `tools/watchdog` records a sample every run
+and `tools/memguard` fits a least-squares slope over the last hour, warning when
+either counter is projected to cross its floor within `MEM_LEAD_MINS`. Fired for
+real within the hour it was written:
+
+```
+MEMORY FALLING (5018MB available, projected to reach 1400MB in ~22 min)
+trend over 60m: available -209.5 MB/min, free -468.5 MB/min
+```
+
+The old level check was silent at that moment, and would have stayed silent for
+another twenty minutes. Use a fit rather than first-vs-last: memory on a shared
+host sawtooths, and two unlucky endpoints either cry wolf or miss a real slide.
+
 ### "CorruptIndexException" usually means the host ran out of memory
 A red cluster with `ALLOCATION_FAILED` and `CorruptIndexException` reads as disk
 corruption. Read the whole nested exception before believing that:
@@ -320,6 +370,43 @@ couple of minutes and needs no action.
 
 Losing `arkime_stats` costs Arkime's own node-statistics history — the UI graphs.
 Sessions and PCAP live in different indices and are untouched.
+
+### A restore test against an empty index proves nothing
+
+Arkime ships a permanently empty `arkime_sessions3-initial` bootstrap index, and
+it sorts **after** the date-stamped ones (`arkime_sessions3-260728`). So the
+obvious way to pick a test index - newest by name - selects the one index that
+can never demonstrate anything, and the restore returns 0 documents against 0
+live. That reads as a working restore if you are only checking for errors.
+
+Pick a test index by a date pattern (or by document count), and require the
+restored count to be **greater than zero** as well as consistent with the live
+one. `tools/snapshot verify` restores under a `restore-check-` rename, compares
+counts, and deletes the copy - so it proves restorability without touching
+anything in use. Restored slightly BELOW live is expected: the index kept being
+written after the snapshot.
+
+### Snapshot Management splits create and update across two verbs
+
+`PUT _plugins/_sm/policies/<name>` on a policy that does **not exist** fails with:
+
+```
+Validation Failed: Sequence number and primary term must be provided
+when updating a snapshot management policy
+```
+
+which reads as "it already exists" and sends you looking for a policy that is not
+there. Create with `POST`; only use `PUT` (with `if_seq_no`/`if_primary_term`) to
+update an existing one.
+
+Registering a repository also proves nothing about whether it can be written to -
+a wrong path or a permissions problem only surfaces on the first snapshot. Call
+`POST _snapshot/<repo>/_verify` at registration time.
+
+Malcolm already sets `path.repo` to `/opt/opensearch/backup` and already
+bind-mounts it to the data disk, so a repository needs no compose change, no new
+mount and no restart - which matters, because restarting OpenSearch under memory
+pressure is itself a risk.
 
 ### An NXDOMAIN leaderboard cannot see the worst name-resolution failures
 "Names that do not exist, asked repeatedly" is the right question, but counting
@@ -683,7 +770,54 @@ look new and exempt it permanently.
 Session metadata is untouched and keeps its own 90-day retention. Losing a raw
 capture costs the packet bytes for an old session, not the session.
 
-### One oversized capture deadlocks the whole mover
+### "One oversized capture deadlocks the mover" - it does not, and this cost real data
+
+**Left here because the wrong conclusion was acted on for a day and it discarded
+traffic.** The reasoning below was plausible, matched the evidence available at
+the time, and was still wrong.
+
+The symptom was real: the pipeline stopped, `pcap/upload` grew, and a 156 MB
+capture was sitting at the head of the queue. Moving it aside restored flow. The
+conclusion drawn - that captures over ~50 MB wedge the mover - became
+`MAX_PCAP_BYTES`, and everything above it went to `pcap/quarantine`, which
+nothing reads. That cost four captures totalling 334 MB in seven hours, one of
+them 1 MB over the line.
+
+Re-measured with `tools/pcap-limit`:
+
+| test | result |
+|---|---|
+| 14 captures 50-106.8 MB already in `processed/` | all present in `arkime_files` - fully analysed |
+| the blamed 156 MB capture, re-fed to the live pipeline | mover 18s, published 30s |
+| the 51 MB capture that was 1 MB over the cap | published in 31s |
+
+And the tell that should have been caught first: `file_processor()` logs its
+`👓` line **before** it does any work, yet the original incident reported no `👓`
+for the file at all. If that file had been what blocked the mover, its `👓` would
+have been the last line in the log.
+
+What actually happened is that the capture was at the head of the queue during
+one of the silent watcher stalls this deployment gets every few hours (below).
+Post hoc, ergo propter hoc.
+
+**The lesson is the method, not the number.** A single incident produced a
+threshold, the threshold silently discarded data, and nobody re-ran the
+experiment because the pipeline looked healthy afterwards - it looked healthy
+because the data was being thrown away before it could cause trouble. When a
+mitigation works by dropping input, verify the input was actually the problem.
+
+`sensor/rotate.sh` now SPLITS anything over the (much higher) cap into
+pipeline-sized pieces with `tcpdump -r ... -C`, so nothing is discarded even if
+some genuine ceiling does exist higher up. `tools/unquarantine` recovers whatever
+the old rule set aside.
+
+**Splitting has one trap of its own:** `tcpdump -w prefix -C n` names the first
+chunk `prefix` with **no numeric suffix**, then `prefix1`, `prefix2`. A
+`prefix[0-9]*` glob silently drops the first chunk - 100 MB of traffic, no error.
+Glob with a bare `*`, and check that the chunk sizes sum to the original (they
+will exceed it by 24 bytes per extra file, which is the pcap header).
+
+### The original (wrong) reasoning, kept for reference
 Symptom: the pipeline stops, `pcap/upload` grows, and the mover **never logs the
 offending file at all** — no `👓`, no error, container healthy. Restarting it
 does not help, because every restart re-encounters the same file and stops
@@ -736,6 +870,63 @@ It iterates the whole ordered deck per pass, processes every settled file, and
 breaks only at the first unsettled one, resetting its sleep to 0.5 s. Measured:
 **443 files drained in ~12 seconds** when a backlog cleared. Do not size the
 rotation interval against that myth.
+
+### A watchdog that heals a fault destroys the evidence for it
+
+Structural, and it is why the stall below stayed "unproven" through dozens of
+incidents rather than through any real difficulty:
+
+- the only thing that reliably NOTICES a stall is `tools/watchdog --heal`
+- the first thing it does about one is restart the container
+
+So every stall was repaired before anything looked at the stalled thread. Not one
+of them was ever examined. The fix is not to stop healing - containment is
+correct - but to collect first: `tools/watchdog` now calls `tools/stall-probe
+dump` before every restart, and `tools/stall-probe start` samples each watcher's
+kernel wait channel every 2 seconds continuously, so the state at the moment of
+the stall is already recorded before the repair runs.
+
+Generalises: any self-healing system needs to capture state before it heals, or
+it converts every incident into an unexplained one.
+
+### The 9p mount degrades by two orders of magnitude, and the settle window is the thing it breaks
+
+Measured with `tools/stall-probe` over an hour of normal operation, against
+`pcap/processed` holding 610 captures:
+
+| operation | p50 | p95 | max |
+|---|---|---|---|
+| listdir | 560 ms | 2,680 ms | **149,480 ms** |
+| stat | 2.35 ms | 47 ms | 103 ms |
+| create | 2.5 ms | 12.5 ms | 118 ms |
+
+A 149-second directory listing - 250x the median for the same operation on the
+same directory - is not a different filesystem, it is the same one under
+contention. There is no cold-mount penalty (checked: first and second listing of
+a freshly mounted share both take ~0.55 s), so this is transient degradation.
+
+**The number that matters is the ratio to `PCAP_PIPELINE_POLLING_ASSUME_CLOSED_SEC`
+(10 s).** Once one scan takes longer than the settle window, the watcher is late
+by construction and presents exactly like a silent stall: no error, no exception,
+container healthy, work simply not happening.
+
+And it gets worse on its own, because scan cost is linear in file COUNT and the
+archive is nowhere near its steady state. Projected from the same measurements at
+the 7-day retention steady state of 5,040 files:
+
+| case | per scan at steady state |
+|---|---|
+| typical (p50) | 4.6 s - inside the window |
+| tail (p95) | **22.1 s - over the window** |
+
+That predicts stalls which are intermittent rather than constant, which is what
+is observed (roughly one every 2-4 hours). Watch it with
+`tools/stall-probe report`, and note it argues for keeping `PCAP_RETENTION_DAYS`
+down, or for moving the hot spool directories off 9p entirely.
+
+Use percentiles, not the mean, when reporting this: one 149 s outlier in 47
+samples drags the mean to 7x the median and manufactures a number that describes
+the spike rather than the system.
 
 ### The silent watcher stalls: what is known, and what is not
 Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.

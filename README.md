@@ -112,9 +112,32 @@ setup steps that script would otherwise have done (see
 Two settings are coupled and worth understanding before changing either:
 `ROTATE_SECS` and `PCAP_RETENTION_DAYS` multiply into the number of files in the
 polled archive, and both a too-long and a too-short rotation have their own
-failure mode. Captures over `MAX_PCAP_BYTES` are quarantined rather than
-ingested, because one oversized file deadlocks the whole pipeline. See
-`config.env.example` and [docs/USING.md](docs/USING.md#quarantined-captures).
+failure mode. Captures over `MAX_PCAP_BYTES` are **split** into pipeline-sized
+pieces and queued — never discarded. See `config.env.example` and
+[docs/USING.md](docs/USING.md).
+
+### Keeping it alive
+
+```sh
+tools/watchdog --heal    # detect and repair silent watcher stalls; run on a timer
+tools/memguard           # memory trend, largest consumers, mitigation ladder
+tools/snapshot verify    # prove the backups restore, rather than assuming it
+tools/stall-probe report # 9p latency against the pipeline's settle window
+tools/pcap-limit         # capture size distribution and what the cap costs
+```
+
+Three things about this deployment are worth knowing up front, because each cost
+real data before it was understood:
+
+- **An out-of-memory host is reported by OpenSearch as a corrupt index**, and a
+  corrupt index cannot be repaired — only deleted. `tools/memguard` warns on the
+  trajectory and sheds load; `tools/snapshot` makes the loss recoverable.
+- **The watchers stall silently** every few hours while every container reports
+  healthy. `tools/watchdog --heal` contains it, and now collects forensics before
+  repairing so the cause can eventually be pinned down.
+- **The Windows bind mount is 60-100x slower than local disk** and degrades far
+  worse than that under contention. Most surprising behaviour in the pipeline
+  traces back to it.
 
 ## Security notes
 
