@@ -347,6 +347,41 @@ max_retry -> shard has exceeded the maximum number of retries [5]
 You then need `POST /_cluster/reroute?retry_failed=true` just to get back to
 where you were. Fix the memory first; retry second.
 
+**Try `allocate_stale_primary` BEFORE concluding the index must be deleted.**
+Observed live on 2026-07-28: the host hit 138 MB free, and the failure was
+
+```
+FileSystemException: .../indices/<uuid>/0/_state: Cannot allocate memory
+shard failure, reason [already closed by tragic event on the translog]
+failure [IOException[Cannot allocate memory]], markAsStale [true]
+```
+
+`markAsStale [true]` is the discriminator, and it is not the same as corrupt.
+The allocation explain API reports `no_valid_shard_copy` / "all found copies are
+either stale or corrupt" for BOTH cases, which reads as unrecoverable and is not.
+A stale copy is a complete, readable shard that the cluster no longer trusts as
+authoritative; with a single node and no replicas there is nothing newer for it
+to conflict with.
+
+Recovery, in this order - the first step is not optional, because allocation will
+just fail again while the cause is live:
+
+```sh
+tools/memguard --act --force-stage 3           # free memory, stop the writes
+tools/osapi es POST '_cluster/reroute?retry_failed=true'
+tools/osapi es POST '_cluster/reroute?retry_failed=true' \
+  '{"commands":[{"allocate_stale_primary":{"index":"<index>","shard":0,
+    "node":"opensearch","accept_data_loss":true}}]}'
+```
+
+`accept_data_loss` refers to losing writes a *newer* copy might hold. On a
+single-node cluster there is no newer copy, so it recovers everything on disk.
+Measured: 620,286 documents came back, against 581,872 in a snapshot taken 90
+minutes earlier - so it beat the restore, and the cluster went green in one step.
+
+Delete-and-restore is the fallback for when the FILES are unreadable, not for
+every red shard.
+
 **`allocate_empty_primary` does not skip corrupt on-disk files.** It still opens
 the existing shard directory, so it fails the same way:
 `IndexShardRecoveryException[failed to fetch index version after copying it
