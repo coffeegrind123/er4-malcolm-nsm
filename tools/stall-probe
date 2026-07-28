@@ -1,0 +1,308 @@
+#!/usr/bin/env bash
+# Settle the silent-watcher-stall question with evidence instead of inference.
+#
+#   tools/stall-probe start      begin sampling (a tiny --pid=host container)
+#   tools/stall-probe status     is it running, how much has it collected
+#   tools/stall-probe report [m] summarise the last m minutes (default 60)
+#   tools/stall-probe dump       deep one-shot forensics, right now
+#   tools/stall-probe stop       stop sampling
+#
+# WHY THIS EXISTS
+#
+# docs/GOTCHAS.md records the stalls as "root cause still unproven", with 9p
+# latency as the leading hypothesis and everything else measured and ruled out.
+# The reason it stayed unproven is structural, not mysterious:
+#
+#   the only tool that reliably NOTICES a stall is `tools/watchdog --heal`,
+#   and the first thing it does about one is restart the container.
+#
+# So every stall so far has been repaired before anything looked at the stalled
+# thread. The evidence was destroyed by the fix, every time. This samples
+# continuously, so the state at the moment of the stall is already on disk before
+# the repair runs - and `tools/watchdog` now calls `dump` BEFORE it heals.
+#
+# WHAT WOULD PROVE OR DISPROVE THE HYPOTHESIS
+#
+# Each watcher thread's kernel wait channel is sampled every couple of seconds:
+#
+#   wchan=p9_client_rpc     parked in the 9p transport to the Windows host
+#   state=D                 uninterruptible kernel sleep - a wedged syscall
+#
+# A stall that shows a multi-minute unbroken run of p9_client_rpc confirms it:
+# the watcher is not looping, not deadlocked in Python, not waiting on
+# OpenSearch - it is stuck in one filesystem call. A stall that shows the thread
+# parked in futex_do_wait or do_epoll_wait for the same period DISPROVES it and
+# sends the search into the Python layer instead. Either answer is worth having;
+# today there is no answer at all.
+#
+# Cost: one alpine container, a few forks every SAMPLE_SECS, no writes to any
+# spool directory, output to the container log rather than to the 9p mount (so
+# the probe does not add load to the thing it is measuring).
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+. "${HERE}/_config.sh"
+
+PROBE_CONTAINER="${PROBE_CONTAINER:-er4-stall-probe}"
+PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+SAMPLE_SECS="${STALL_PROBE_SAMPLE_SECS:-2}"
+LAT_SECS="${STALL_PROBE_LAT_SECS:-30}"
+FORENSICS_DIR="${FORENSICS_DIR:-${STATE_DIR:-${TMPDIR:-/tmp}/er4-watchdog}/forensics}"
+
+say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()  { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn(){ printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+
+# The sampler script has to be visible INSIDE the container, and under Docker
+# Desktop a bind source must be an absolute Windows-style path - a relative one
+# silently mounts an empty directory (docs/GOTCHAS.md). REPO_DIR_WIN is derived
+# in _config.sh from KEYS_DIR_WIN, which every install already sets.
+repo_win() {
+  if [[ -n "${REPO_DIR_WIN:-}" ]]; then echo "${REPO_DIR_WIN}"; return 0; fi
+  echo ""
+}
+
+cmd_start() {
+  if docker ps --format '{{.Names}}' | grep -qx "$PROBE_CONTAINER"; then
+    ok "already sampling (${PROBE_CONTAINER})"; return 0
+  fi
+  docker rm -f "$PROBE_CONTAINER" >/dev/null 2>&1 || true
+
+  local win; win="$(repo_win)"
+  if [[ -z "$win" ]]; then
+    echo "REPO_DIR_WIN is unset and could not be derived from KEYS_DIR_WIN." >&2
+    echo "Set it in config.env to this repo's Windows-style path." >&2
+    return 1
+  fi
+
+  say "starting sampler (every ${SAMPLE_SECS}s, filesystem probe every ${LAT_SECS}s)"
+  docker run -d --name "$PROBE_CONTAINER" \
+    --restart unless-stopped \
+    --pid=host --privileged \
+    --memory 64m \
+    -e SAMPLE_SECS="$SAMPLE_SECS" -e LAT_SECS="$LAT_SECS" \
+    -v "${win}/tools:/probe:ro" \
+    -v "${PCAP_MOUNT}:/pcap" \
+    --log-driver json-file --log-opt max-size=20m --log-opt max-file=3 \
+    alpine sh /probe/stall-probe.sampler.sh >/dev/null || return 1
+
+  sleep 4
+  if docker ps --format '{{.Names}}' | grep -qx "$PROBE_CONTAINER"; then
+    ok "sampling; check back with: tools/stall-probe report"
+  else
+    warn "container exited immediately:"
+    docker logs "$PROBE_CONTAINER" 2>&1 | tail -5 | sed 's/^/      /'
+    return 1
+  fi
+}
+
+cmd_stop() {
+  docker rm -f "$PROBE_CONTAINER" >/dev/null 2>&1 && ok "stopped (log discarded)" || ok "not running"
+}
+
+cmd_status() {
+  if ! docker ps --format '{{.Names}}' | grep -qx "$PROBE_CONTAINER"; then
+    warn "not running - start it with: tools/stall-probe start"; return 1
+  fi
+  local n first
+  n=$(docker logs "$PROBE_CONTAINER" 2>/dev/null | grep -c '"k":"thr"')
+  first=$(docker logs "$PROBE_CONTAINER" 2>/dev/null | head -1)
+  ok "running, ${n} thread samples collected"
+  echo "      first line: ${first}"
+}
+
+# One-shot deep forensics. This is what runs at the moment of a stall, and it
+# deliberately collects more than the sampler does - a stalled watcher is worth
+# a few hundred milliseconds of extra probing, and it is the only chance to get
+# it before the repair erases the state.
+cmd_dump() {
+  local label="${1:-manual}" out
+  mkdir -p "$FORENSICS_DIR"
+  out="${FORENSICS_DIR}/$(date -u +%Y%m%dT%H%M%SZ)-${label}.txt"
+
+  {
+    echo "# stall forensics: ${label}  $(date -u +%FT%TZ)"
+    echo
+    echo "## host memory"
+    free -m 2>/dev/null
+    echo
+    echo "## watcher threads (state / wait channel / syscall)"
+    docker run --rm --privileged --pid=host alpine sh -c '
+      ps -eo pid,args 2>/dev/null | while read -r pid rest; do
+        # Match the interpreter, not just the string. Without this the probe
+        # matches ITS OWN docker client: the command passed to `docker run ... sh -c`
+        # contains "pcap_watcher.py", so the docker CLI process argv does too, and it
+        # gets labelled as the publisher - complete with its threads and its cwd.
+        case "$rest" in python*) ;; *) continue ;; esac
+        case "$rest" in
+          *pcap_watcher.py*)              role=publisher ;;
+          *watch-pcap-uploads-folder.py*) role=mover ;;
+          *filebeat-watch-zeeklogs*)      role=zeek-extract ;;
+          *) continue ;;
+        esac
+        echo "### ${role} pid=${pid}"
+        # utime/stime tell you whether it is BURNING cpu or parked: a wedged
+        # syscall shows a state letter of D or S with no cpu movement at all.
+        for t in /proc/$pid/task/*; do
+          [ -d "$t" ] || continue
+          printf "  tid=%-8s comm=%-16s state=%s wchan=%-24s syscall=%s\n" \
+            "${t##*/}" "$(cat $t/comm 2>/dev/null)" \
+            "$(awk "{print \$3}" $t/stat 2>/dev/null)" \
+            "$(cat $t/wchan 2>/dev/null)" \
+            "$(cut -d\  -f1 $t/syscall 2>/dev/null)"
+        done
+        # Zero open sockets was the fingerprint of the publisher stall: alive,
+        # no error, and simply not talking to anything.
+        echo "  open fds: $(ls /proc/$pid/fd 2>/dev/null | wc -l)  sockets: $(ls -l /proc/$pid/fd 2>/dev/null | grep -c socket)"
+        echo "  cwd: $(readlink /proc/$pid/cwd 2>/dev/null)"
+      done' 2>&1
+    echo
+    echo "## pipeline position"
+    docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c '
+      echo "  upload:    $(ls -1 /p/upload/*.pcap 2>/dev/null | wc -l) files, oldest $(ls -1 /p/upload/*.pcap 2>/dev/null | head -1 | xargs -r basename)"
+      echo "  processed: $(ls -1 /p/processed/*.pcap 2>/dev/null | wc -l) files, newest $(ls -t /p/processed/*.pcap 2>/dev/null | head -1 | xargs -r basename)"' 2>&1
+    echo
+    echo "## last publisher/mover activity"
+    docker logs --since 15m "${COMPOSE_PROJECT:-malcolm}-pcap-monitor-1" 2>&1 | grep -E '📫|🖅|🖄|👓' | tail -8
+  } > "$out" 2>&1
+
+  ok "forensics written to ${out}"
+  echo "$out"
+}
+
+cmd_report() {
+  local mins="${1:-60}"
+  if ! docker ps -a --format '{{.Names}}' | grep -qx "$PROBE_CONTAINER"; then
+    warn "no probe container - start it with: tools/stall-probe start"; return 1
+  fi
+  # The watcher's settle window and the retention steady-state file count are
+  # what the scan latency has to be judged against, so pass them in rather than
+  # leaving the reader to do the arithmetic.
+  local retain_files=$(( 86400 / ${ROTATE_SECS:-120} * ${PCAP_RETENTION_DAYS:-7} ))
+  docker logs --since "${mins}m" "$PROBE_CONTAINER" 2>/dev/null | \
+    SETTLE_SEC="${PCAP_SETTLE_SEC:-10}" RETAIN_FILES="$retain_files" python3 -c '
+import sys, json, collections, os
+
+SETTLE_SEC   = os.environ.get("SETTLE_SEC", "10")
+RETAIN_FILES = int(os.environ.get("RETAIN_FILES", "5040"))
+
+# x86_64 syscall numbers seen in this pipeline. Naming them matters: "262" is
+# unreadable, "newfstatat" immediately says the thread is stat()ing a file, and
+# that is precisely the operation the 9p hypothesis is about.
+SYSCALL = {"0":"read","1":"write","4":"stat","5":"fstat","6":"lstat","7":"poll",
+           "16":"ioctl","23":"select","35":"nanosleep","39":"getpid","41":"socket",
+           "42":"connect","44":"sendto","45":"recvfrom","61":"wait4","72":"fcntl",
+           "82":"rename","87":"unlink","202":"futex","217":"getdents64",
+           "228":"clock_gettime","230":"clock_nanosleep","232":"epoll_wait",
+           "257":"openat","262":"newfstatat","270":"pselect6","281":"epoll_pwait",
+           "318":"getrandom","332":"statx","439":"faccessat2","-1":"(none)"}
+
+thr = []
+fs  = []
+for line in sys.stdin:
+    line = line.strip()
+    if not line.startswith("{"): continue
+    try: d = json.loads(line)
+    except Exception: continue
+    if d.get("k") == "thr": thr.append(d)
+    elif d.get("k") == "fs": fs.append(d)
+
+if not thr:
+    print("no thread samples in window"); raise SystemExit(0)
+
+span = max(d["t"] for d in thr) - min(d["t"] for d in thr)
+print(f"\n  {len(thr)} thread samples over {span//60}m {span%60}s, {len(fs)} filesystem probes\n")
+
+# --- where each watcher actually waits ---------------------------------------
+by_role = collections.defaultdict(list)
+for d in thr: by_role[d["role"]].append(d)
+
+for role in sorted(by_role):
+    rows = by_role[role]
+    print(f"  {role}")
+    wch = collections.Counter(d["wchan"] for d in rows)
+    tot = sum(wch.values())
+    for w, n in wch.most_common(6):
+        print(f"      {100*n/tot:5.1f}%  {w}")
+    dstate = sum(1 for d in rows if d["st"] == "D")
+    if dstate:
+        print(f"      {100*dstate/tot:5.1f}%  [state D - uninterruptible kernel sleep]")
+
+    # The headline number. A thread parked in ONE wait channel across many
+    # consecutive samples is not polling; it is stuck. Track the longest such
+    # run per thread, because that is exactly the shape of a stall.
+    runs = collections.defaultdict(lambda: [None, 0, 0])   # tid -> [wchan, run, best]
+    best = {}
+    for d in sorted(rows, key=lambda d: (d["tid"], d["t"])):
+        st = runs[d["tid"]]
+        if st[0] == d["wchan"]:
+            st[1] += 1
+        else:
+            st[0], st[1] = d["wchan"], 1
+        key = (d["tid"], d["comm"], d["wchan"])
+        if st[1] > best.get(key, 0): best[key] = st[1]
+    interesting = sorted(
+        ((n, k) for k, n in best.items() if k[2] not in ("0", "")),
+        reverse=True)[:4]
+    for n, (tid, comm, w) in interesting:
+        print(f"      longest unbroken: {w} for {n} samples (~{n*2}s) [tid {tid} {comm}]")
+    scs = collections.Counter(SYSCALL.get(d["sc"], d["sc"]) for d in rows if d["sc"] not in ("?", "-1"))
+    if scs:
+        print("      syscalls: " + ", ".join(f"{s} {100*n/tot:.0f}%" for s, n in scs.most_common(4)))
+    print()
+
+# --- what the 9p mount costs -------------------------------------------------
+if fs:
+    def pct(vals, p):
+        vals = sorted(vals)
+        return vals[min(len(vals)-1, int(len(vals)*p/100))]
+    for field, unit in (("listdir_us","ms"), ("stat_us","us"), ("create_us","us")):
+        v = [d[field] for d in fs if field in d]
+        if not v: continue
+        div = 1000 if unit == "ms" else 1
+        print(f"  {field:<12} p50 {pct(v,50)/div:>8.1f}{unit}   p95 {pct(v,95)/div:>8.1f}{unit}   max {max(v)/div:>8.1f}{unit}")
+    # The number that decides whether the pipeline is late BY CONSTRUCTION.
+    # pcap_watcher treats a file as settled once it has been unchanged for
+    # PCAP_PIPELINE_POLLING_ASSUME_CLOSED_SEC (10s). If one directory scan takes
+    # longer than that, the watcher cannot keep its own schedule - and that
+    # presents exactly like the silent stalls: no error, no exception, container
+    # healthy, work simply not happening.
+    #
+    # Scan cost is linear in the FILE COUNT, and the archive is nowhere near its
+    # steady state, so this ratio gets worse on its own over the retention window.
+    settle_ms = int(SETTLE_SEC) * 1000
+    ld = [d["listdir_us"]/1000 for d in fs if "listdir_us" in d]
+    if ld:
+        over = [v for v in ld if v > settle_ms]
+        print(f"\n  settle window is {SETTLE_SEC}s; {len(over)}/{len(ld)} scans exceeded it"
+              + (f" (worst {max(over)/1000:.0f}s = {max(over)/settle_ms:.0f}x)" if over else ""))
+        entries = fs[-1].get("entries", 0)
+        if entries:
+            # Percentiles, NOT the mean. A single 149s outlier in 47 samples drags
+            # the mean to 7x the median and would project a scare number that says
+            # more about one spike than about the steady state. Project the typical
+            # case and the tail case separately, and let them disagree.
+            per50 = pct(ld, 50)/entries
+            per95 = pct(ld, 95)/entries
+            for lbl, per in (("typical", per50), ("p95", per95)):
+                proj = per * RETAIN_FILES / 1000
+                print(f"  {lbl:>7}: {per:.2f} ms/entry at {entries} entries ->"
+                      f" {proj:.1f}s per scan at the {RETAIN_FILES}-file retention steady state"
+                      + ("   <-- exceeds the settle window" if proj > int(SETTLE_SEC) else ""))
+
+    stuck = [d for d in fs if d.get("newest_age", 0) > 600]
+    if stuck:
+        print(f"\n  {len(stuck)} probe(s) saw processed/ go >10m without a new capture (pipeline stopped)")
+    last = fs[-1]
+    print("\n  processed/ holds {} captures; upload queue {} pending".format(
+        last.get("entries"), last.get("upload")))
+'
+}
+
+case "${1:-help}" in
+  start)  shift; cmd_start "$@" ;;
+  stop)   shift; cmd_stop "$@" ;;
+  status) shift; cmd_status "$@" ;;
+  report) shift; cmd_report "$@" ;;
+  dump)   shift; cmd_dump "$@" ;;
+  help|*) sed -n '2,10p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac

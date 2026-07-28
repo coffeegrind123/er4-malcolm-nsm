@@ -56,21 +56,65 @@ HEAL=0; [[ "${1:-}" == "--heal" ]] && HEAL=1
 # It is worth warning early because the loss is not recoverable and the next
 # index to be hit may be a session index rather than a stats one.
 MEM_WARN_MB="${MEM_WARN_MB:-2048}"       # available memory below this is dangerous
+MEM_FREE_WARN_MB="${MEM_FREE_WARN_MB:-800}"
 SWAP_WARN_PCT="${SWAP_WARN_PCT:-85}"     # swap this full means the host is already thrashing
+MEM_LEAD_MINS="${MEM_LEAD_MINS:-30}"
 problems=0
 report() { echo "$*"; problems=$((problems + 1)); }
 
-if [[ -r /proc/meminfo ]]; then
+# Memory is delegated to tools/memguard, which keeps the sample history a trend
+# needs. The check here used to be level-only against MemAvailable, and on this
+# host that cannot be an early warning: routine load floors at ~1557 MB and the
+# corruption incident happened at 1369 MB, so the entire margin is ~190 MB.
+#
+# Two things changed. It now also watches MemFree - MemAvailable counts page
+# cache as if it were already yours, and this host has been observed at 546 MB
+# free while MemAvailable read a comfortable 6,590 MB. And it warns on the
+# TRAJECTORY, which is the only way to get lead time out of a 190 MB margin.
+if [[ -r /proc/meminfo && -x "${HERE}/memguard" ]]; then
+  "${HERE}/memguard" --sample >/dev/null 2>&1
+
   mem_avail=$(awk '/^MemAvailable:/{print int($2/1024)}' /proc/meminfo)
+  mem_free=$(awk '/^MemFree:/{print int($2/1024)}' /proc/meminfo)
   swap_total=$(awk '/^SwapTotal:/{print int($2/1024)}' /proc/meminfo)
   swap_free=$(awk '/^SwapFree:/{print int($2/1024)}' /proc/meminfo)
   swap_pct=0
   [[ "${swap_total:-0}" -gt 0 ]] && swap_pct=$(( (swap_total - swap_free) * 100 / swap_total ))
 
+  # Minutes until the projected line crosses each floor, from the sample history.
+  # -1 means "not falling" or "too few samples".
+  read -r mem_eta free_eta < <("${HERE}/memguard" --eta 2>/dev/null || echo "-1 -1")
+
   if [[ "${mem_avail:-99999}" -lt "$MEM_WARN_MB" ]]; then
-    report "MEMORY LOW (${mem_avail}MB available, swap ${swap_pct}% used) - OpenSearch reports this as index corruption, not as an OOM"
+    report "MEMORY LOW (${mem_avail}MB available, ${mem_free}MB free, swap ${swap_pct}% used) - OpenSearch reports this as index corruption, not as an OOM"
+    if [[ "$HEAL" -eq 1 ]]; then
+      echo "  healing: running the memory ladder"
+      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
+    fi
+  elif [[ "${mem_free:-99999}" -lt "$MEM_FREE_WARN_MB" ]]; then
+    # Free memory this low with plenty "available" means the host is one slow
+    # reclaim away from an allocation failure - and the cache being reclaimed is
+    # backing a 9p mount, so that reclaim is slow.
+    report "MEMORY FREE LOW (${mem_free}MB free, ${mem_avail}MB available) - reclaimable, but the reclaim is off a 60-100x slower filesystem"
+    if [[ "$HEAL" -eq 1 ]]; then
+      echo "  healing: dropping the Docker VM page cache"
+      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
+    fi
+  elif [[ "${mem_eta:--1}" -ge 0 && "${mem_eta}" -le "$MEM_LEAD_MINS" ]]; then
+    report "MEMORY FALLING (${mem_avail}MB available, projected to reach ${MEM_WARN_MB}MB in ~${mem_eta} min) - act now, not at the floor"
+    if [[ "$HEAL" -eq 1 ]]; then
+      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
+    fi
+  elif [[ "${free_eta:--1}" -ge 0 && "${free_eta}" -le "$MEM_LEAD_MINS" ]]; then
+    report "FREE MEMORY FALLING (${mem_free}MB free, projected to reach ${MEM_FREE_WARN_MB}MB in ~${free_eta} min)"
+    if [[ "$HEAL" -eq 1 ]]; then
+      "${HERE}/memguard" --act 2>&1 | sed -n 's/^    /  /p'
+    fi
   elif [[ "${swap_pct:-0}" -ge "$SWAP_WARN_PCT" ]]; then
     report "SWAP PRESSURE (${swap_pct}% of swap in use, ${mem_avail}MB available) - a flush failing here corrupts a shard irrecoverably"
+  else
+    # Give indexing back if it was shed during an earlier incident.
+    "${HERE}/memguard" --restore 2>/dev/null | sed -n 's/^    /  /p' || true
   fi
 fi
 
@@ -116,6 +160,23 @@ else
   touch "$cstate"
 fi
 
+# Capture the state of a stalled watcher BEFORE repairing it.
+#
+# This is why the stall root cause has stayed unproven through dozens of
+# incidents: the only thing that reliably notices a stall is this script, and the
+# first thing it does about one is restart the container. Every repair has
+# destroyed the evidence needed to explain what it was repairing.
+#
+# It is deliberately best-effort and time-bounded. A forensics collection that
+# hangs would delay the repair, and the repair matters more than the diagnosis.
+forensics() { # forensics <label>
+  [[ -x "${HERE}/stall-probe" ]] || return 0
+  local out
+  out=$(timeout 45 "${HERE}/stall-probe" dump "$1" 2>/dev/null | tail -1) || true
+  [[ -n "$out" ]] && echo "  forensics captured before healing: ${out}"
+  return 0
+}
+
 docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SENSOR_CONTAINER" \
   || report "SENSOR DOWN (${SENSOR_CONTAINER} not running)"
 
@@ -159,6 +220,7 @@ if [[ -n "${newest:-}" && "${newest:-0}" -gt 0 ]]; then
     else
       report "PUBLISHER STALLED (captures arriving, last publish ${lag}s older than newest capture)"
       if [[ "$HEAL" -eq 1 ]]; then
+        forensics "publisher-stall"
         echo "  healing: restarting ${MONITOR_CONTAINER}"
         if (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart pcap-monitor >/dev/null 2>&1); then
           date -u +%s > "$pstate"
@@ -277,6 +339,7 @@ check_queue() { # check_queue <label> <mount> <glob-dir> <service-to-restart>
 
     report "QUEUE STALLED: ${label} (${count} pending, oldest capture ${age}s old, consumer produced no events)"
     if [[ "$HEAL" -eq 1 && -n "$svc" ]]; then
+      forensics "queue-wedged-$(echo "$label" | tr '/' '_')"
       echo "  healing: restarting ${svc}"
       (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
       date -u +%s > "$rstate"

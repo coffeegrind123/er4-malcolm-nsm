@@ -59,6 +59,15 @@ if [[ -n "${DATA_ROOT_WIN:-}" ]]; then
   : "${ZEEK_MOUNT:=${DATA_ROOT_WIN}/zeek-logs}"
 fi
 
+# Windows-side path of this repo, needed by any tool that mounts a script from
+# here INTO a container - under Docker Desktop a relative or Linux-style source
+# silently mounts an empty directory instead of erroring (docs/GOTCHAS.md).
+# KEYS_DIR_WIN already points inside the repo, so derive rather than adding a
+# second path for the operator to keep in sync.
+if [[ -z "${REPO_DIR_WIN:-}" && -n "${KEYS_DIR_WIN:-}" ]]; then
+  export REPO_DIR_WIN="${KEYS_DIR_WIN%/keys}"
+fi
+
 # config.env calls it MALCOLM_ADMIN_USER; the API tools read MALCOLM_USER. Same
 # account, two names, so setting it in config.env silently did nothing to them.
 if [[ -n "${MALCOLM_ADMIN_USER:-}" ]]; then
