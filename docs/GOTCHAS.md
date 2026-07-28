@@ -500,3 +500,42 @@ monitoring — remote shells, artefact uploads, the capture transport itself
 More generally: the measurement perturbs the thing measured, and on a quiet home
 network the perturbation can dominate. Establish what your own tooling
 contributes before drawing conclusions about anything else.
+
+### The silent watcher stalls: what is known, and what is not
+Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.
+Roughly one every 2-4 hours. `tools/watchdog --heal` contains them with no data
+loss, and the honest position is that the **root cause is still unproven**.
+
+Ruled out by measurement, so nobody repeats the work:
+
+- **Not OOM.** Zero kernel OOM kills. Container restart counts stay at 0 — the
+  containers never die, only threads inside them stop.
+- **Not simply memory.** Dropping OpenSearch's heap 6g→4g freed 2.4 GB and made
+  stalls roughly 2x rarer, but did not stop them. Memory contributes; it is not
+  the mechanism.
+- **Not unbounded directory growth.** `zeek-logs/current` sits at ~880 symlinks,
+  which is *steady state* for `LOG_CLEANUP_MINUTES=360` — about 12 log types
+  across 72 rotations in the retention window. The cleaner runs every minute and
+  works.
+- **Not dangling symlinks.** All resolve.
+- **Not OpenSearch backpressure.** Cluster green, 26% heap, no old-gen GC, 305ms
+  query latency while a watcher was stalled.
+
+The one measured anomaly is **filesystem latency**. The Docker Desktop Windows
+bind mount is 60-100x slower than the VM's native filesystem:
+
+| operation | 9p bind mount | native |
+|---|---|---|
+| create | 3.06 ms | 0.05 ms |
+| listdir | 2.12 ms | 0.02 ms |
+| stat | 1.46 ms | 0.00 ms |
+
+Every stalling watcher polls directories on that mount. A blocked 9p operation
+would present exactly as observed: thread sleeping, no CPU, **zero open
+sockets**, no exception, container healthy. That is a hypothesis consistent with
+all the evidence, not a proven cause.
+
+If it needs a real fix rather than containment, the change to try is moving the
+**hot spool directories** (`pcap/upload`, `pcap/processed`, `zeek-logs/*`) onto a
+Docker volume on the VM's own filesystem, leaving only long-term PCAP storage on
+the large host disk. That removes 9p from the polling path entirely.
