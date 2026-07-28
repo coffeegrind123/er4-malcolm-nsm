@@ -963,46 +963,49 @@ Use percentiles, not the mean, when reporting this: one 149 s outlier in 47
 samples drags the mean to 7x the median and manufactures a number that describes
 the spike rather than the system.
 
-### The first stall whose evidence survived the repair - and it was not 9p
+### The Zeek extractor stalls because a thread dies, and it is not 9p
 
-Captured 2026-07-28 18:30 by `tools/watchdog` calling `tools/stall-probe dump`
-before healing. `zeek-logs/upload` had 4 tarballs pending, oldest 520 s, and the
-consumer had produced no events.
+Two stalls captured 2026-07-28 (18:30 and 18:48) by `tools/watchdog` calling
+`tools/stall-probe dump` before healing - the first of these incidents ever
+examined rather than restarted away.
 
-**What the thread state showed:**
+**Not 9p.** In both dumps, no watcher thread was in `p9_client_rpc` and none was
+in state `D`; they were parked in `futex_do_wait` and `hrtimer_nanosleep`. The
+pcap mover and publisher both handled a capture seconds before the first dump, so
+the stall was isolated to the Zeek tarball extractor. Whatever stops that queue,
+it is not a wedged filesystem syscall.
 
-| watcher | threads |
-|---|---|
-| publisher | `hrtimer_nanosleep`, `futex_do_wait` x2, `do_epoll_wait` x2 |
-| mover | `hrtimer_nanosleep`, `futex_do_wait` x2 |
-| zeek-extract | `hrtimer_nanosleep`, `futex_do_wait` |
+**What it is.** The extractor runs 3 threads when healthy. In both cycles it
+dropped to 2, and drain activity stopped in the same minute:
 
-Not one thread in `p9_client_rpc`. Not one in state `D`. So whatever stopped that
-queue, **it was not a wedged 9p syscall** - which is the leading hypothesis for
-these stalls, and it does not explain this one.
+| time | threads | extractor log activity |
+|---|---|---|
+| 17:37-18:24 | 3 | active, 22 events at 18:23 |
+| **18:24:34** | **2** | **stops - nothing until the 18:30 restart** |
+| 18:31:24 | 3 | resumes, 18:30-18:33 |
+| **18:33:28** | **2** | **stops - nothing until the 18:48 restart** |
+| 18:49:05 | 3 | resumes |
 
-The pcap pipeline was working normally throughout: the mover and publisher both
-handled a capture at 18:29:39 and 18:29:53, seconds before the dump. The stall
-was isolated to the Zeek tarball extractor.
+A restart brings the thread back and drain resumes, which is why restarting
+"works" and why the cause was never found: the repair is effective and erases the
+evidence in one step.
 
-**The red herring, recorded because it was convincing.** The probe history showed
-the extractor running 3 threads steadily for 47 minutes, then dropping to 2 at
-18:24:34 - apparently a worker dying and taking the queue with it. It does not
-survive checking:
+**A trap inside the trap, worth more than the finding.** This was briefly
+dismissed as a coincidence, on the strength of a single check: the extractor was
+observed at 2 threads while a log line showed it processing a tarball. That log
+line was timestamped 18:33:04 - **24 seconds BEFORE** the 18:33:28 drop. A stale
+timestamp read as current activity, and it produced exactly the wrong conclusion
+with apparent evidence behind it.
 
-- the queue's oldest entry dated from ~18:21:23, **before** the thread went
-- after the repair the extractor settled back to 2 threads and drained normally,
-  so 2 is a working steady state
+When correlating an event with an activity log, check that the activity is
+*after* the event, not merely near it. "Is it working now?" needs a timestamp
+comparison, not a glance.
 
-The third thread is transient. A "restart when the thread count drops" rule built
-from that correlation would fire on a healthy extractor forever - the exact
-self-inflicted restart loop this file already warns about. `tools/stall-probe
-threads` exists as a diagnostic and is deliberately **not** wired into the
-watchdog.
-
-Two lessons worth more than the finding: a correlation that appears at the moment
-of an incident is still only a correlation, and the cheapest test is to ask
-whether the "broken" state is also present when things work.
+**Detection.** Thread loss is visible within one poll; the queue-age rule took
+5.5 minutes to fire. `tools/watchdog` now checks both together - a thread count
+below the maximum observed for that process AND no drain events - because either
+signal alone false-positives: thread counts fluctuate transiently at startup, and
+a deep queue can drain perfectly well.
 
 ### The silent watcher stalls: what is known, and what is not
 Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.

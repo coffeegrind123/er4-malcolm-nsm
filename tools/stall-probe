@@ -170,27 +170,20 @@ cmd_dump() {
   echo "$out"
 }
 
-# A thread census. DIAGNOSTIC ONLY - deliberately not wired into the watchdog.
+# A thread census - the earliest signal there is for a stalled Zeek extractor.
 #
-# Worth reading before trusting thread count as a stall signal, because it looked
-# conclusive and was not. During the first stall whose evidence survived the
-# repair (2026-07-28 18:30) the zeek extractor went from 3 threads to 2 at
-# 18:24:34, which lined up neatly with a queue that had stopped draining.
+# Measured across two consecutive stalls (2026-07-28 18:24 and 18:33): the
+# extractor runs 3 threads when healthy, drops to 2, and drain activity stops in
+# the same minute. A restart restores the third thread and drain resumes. Thread
+# loss is visible within one poll; the queue-age rule took 5.5 minutes.
 #
-# It does not hold up:
+# USE IT TOGETHER WITH DRAIN ACTIVITY, never alone. Thread counts fluctuate
+# transiently around startup, and a restart-on-low-count rule by itself would
+# restart healthy watchers forever - the self-inflicted restart loop this repo
+# already has scars from. tools/watchdog requires both signals.
 #
-#   - the queue's oldest entry dated from ~18:21:23, BEFORE the thread went
-#   - after the repair the extractor settled back to 2 threads and drained
-#     normally, so 2 is a working steady state, not a wedged one
-#
-# The third thread is transient. A restart-on-low-thread-count rule built from
-# that correlation would fire on a perfectly healthy extractor - which is exactly
-# the self-inflicted restart loop docs/GOTCHAS.md already warns about.
-#
-# What the same forensics DID establish is narrower and still useful: at the
-# moment of that stall no watcher thread was in p9_client_rpc or in state D.
-# They were parked in futex_do_wait and hrtimer_nanosleep. Whatever stopped that
-# queue, it was not a wedged 9p syscall.
+# The process age matters for the same reason: a watcher still inside its
+# --start-sleep has not finished spawning its threads yet.
 cmd_threads() {
   docker run --rm --privileged --pid=host alpine sh -c '
     ps -eo pid,args 2>/dev/null | while read -r pid rest; do

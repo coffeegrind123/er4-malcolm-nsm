@@ -399,6 +399,55 @@ drain_container() { # map a compose service to its container name
   esac
 }
 
+# A watcher that has LOST a thread, cross-checked against whether it is still
+# doing anything. Both signals are required:
+#
+#   thread loss alone   -> transient fluctuations at startup would restart a
+#                          healthy watcher forever
+#   no drain alone      -> that is the existing queue-age check, and it needs the
+#                          queue to age past STALL_SECS first (measured: 5.5 min)
+#
+# Together they caught the Zeek extractor twice within a poll of the thread
+# going. The peak count is remembered per role rather than hardcoded, so this
+# adapts to whatever a healthy watcher looks like on this install instead of
+# encoding a number that a Malcolm upgrade would invalidate.
+check_threads() {
+  [[ -x "${HERE}/stall-probe" ]] || return 0
+  local role count age peak pstate svc
+  while read -r role count age; do
+    [[ -z "${role:-}" || -z "${count:-}" ]] && continue
+    # Still starting up: pcap_watcher sleeps 60s and the movers 30s before they
+    # spawn their workers, so a fresh process legitimately has fewer threads.
+    [[ "${age:-0}" -lt 120 ]] && continue
+
+    pstate="${STATE_DIR}/threads.${role}"
+    peak=0; [[ -f "$pstate" ]] && peak=$(cat "$pstate" 2>/dev/null || echo 0)
+    if [[ "$count" -gt "$peak" ]]; then echo "$count" > "$pstate"; continue; fi
+    [[ "$count" -ge "$peak" ]] && continue
+
+    case "$role" in
+      zeek-extract) svc=filebeat ;;
+      publisher|mover) svc=pcap-monitor ;;
+      *) continue ;;
+    esac
+
+    local drained
+    drained=$(docker logs --since 5m "$(drain_container "$svc")" 2>&1 | grep -cE '🖅|📫|🖄' || true)
+    [[ "${drained:-0}" -gt 0 ]] && continue   # lost a thread but still working
+
+    report "WATCHER THREAD LOST: ${role} has ${count} threads (peak ${peak}) and produced no events in 5m"
+    if [[ "$HEAL" -eq 1 ]]; then
+      forensics "thread-lost-${role}"
+      echo "  healing: restarting ${svc}"
+      (cd "$MALCOLM_DIR" && docker compose --profile malcolm restart "$svc" >/dev/null 2>&1)
+      # The peak is re-learned after a restart; a stale peak from a previous
+      # container would otherwise make every fresh start look degraded.
+      rm -f "$pstate"
+    fi
+  done < <("${HERE}/stall-probe" threads 2>/dev/null)
+}
+check_threads
+
 check_queue "pcap/upload"      "$PCAP_MOUNT" "upload/*.pcap"    "pcap-monitor"
 check_queue "zeek-logs/upload" "$ZEEK_MOUNT" "upload/*.tar.gz" "filebeat"
 
