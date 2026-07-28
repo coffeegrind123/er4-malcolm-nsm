@@ -336,6 +336,19 @@ The NXDOMAIN list is the fastest way to find that class of problem: **names that
 do not exist, asked repeatedly, are always a misconfiguration.** Worth acting on
 even when harmless, because the volume buries everything else.
 
+**The NXDOMAIN list is only half the picture.** When a name fails, the OS falls
+back to LLMNR and mDNS, which are multicast to every device on the segment, and
+an unanswered multicast query returns nothing at all — no rcode, so nothing to
+count as NXDOMAIN. `tools/investigate` reports those separately under
+*Unanswered LLMNR/mDNS*. Expect it to be several times larger than the NXDOMAIN
+figure for the same name; measured here, 8x.
+
+Treat that line as a security finding rather than noise. A host asking the whole
+segment "who is `postgres`?" thousands of times is the Responder / NTLM-relay
+setup — any machine that answers becomes that host, and the asker will
+authenticate to it. Fixing the broken lookup removes the exposure; disabling
+LLMNR and mDNS on the host removes the class.
+
 Two things that will show up there and are not misconfigurations:
 
 - `wpad.lan` / `wpad.<domain>` — Windows proxy auto-discovery. Harmless here, but

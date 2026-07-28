@@ -268,6 +268,37 @@ with no error even though documents plainly carry the field. Use
 
 ### A `-` bucket means "field absent", not a value.
 
+### An NXDOMAIN leaderboard cannot see the worst name-resolution failures
+"Names that do not exist, asked repeatedly" is the right question, but counting
+`rcode_name: NXDOMAIN` answers only half of it. When a lookup fails, the OS falls
+back to **LLMNR and mDNS**, which are multicast to the whole segment — and an
+unanswered multicast query produces **no response at all**, so it carries no
+rcode and never reaches the leaderboard.
+
+Measured here: 539 NXDOMAIN in an hour, against **27,134 unanswered multicast
+queries in six**. The leaderboard under-reported the class by roughly 8x and
+missed its single largest contributor. The same misconfigured hostname appeared
+in both, so nothing looked missing — the unicast portion was just the visible tip.
+
+Query the multicast resolvers directly and filter on the *absence* of an rcode:
+
+```json
+{"filter": [{"terms": {"destination.ip": ["224.0.0.252", "224.0.0.251"]}}],
+ "must_not": [{"exists": {"field": "zeek.dns.rcode_name"}}]}
+```
+
+It is also the more serious half, and not merely noise. A host repeatedly asking
+the entire segment "who is `postgres`?" is the Responder / NTLM-relay setup: any
+machine that answers becomes that host. WPAD is flagged for exactly this reason;
+LLMNR and mDNS are the same class.
+
+### `track_total_hits` silently caps at 10,000
+A hit total is capped at 10,000 by default, and the cap looks like data — the
+count is a plausible round number rather than an error. The multicast section
+above first reported exactly `10000` while its own aggregation buckets already
+summed past 26,000. Pass `"track_total_hits": true` whenever the number itself is
+the finding, and sanity-check a total against the buckets beneath it.
+
 ### A time-windowed heading over an unfiltered query
 `tools/investigate` printed `Corpus (last 1h)` above a PPL query that carried no
 time filter at all, so it counted the **entire index** under a heading claiming
