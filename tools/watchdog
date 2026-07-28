@@ -420,11 +420,6 @@ check_threads() {
     # spawn their workers, so a fresh process legitimately has fewer threads.
     [[ "${age:-0}" -lt 120 ]] && continue
 
-    pstate="${STATE_DIR}/threads.${role}"
-    peak=0; [[ -f "$pstate" ]] && peak=$(cat "$pstate" 2>/dev/null || echo 0)
-    if [[ "$count" -gt "$peak" ]]; then echo "$count" > "$pstate"; continue; fi
-    [[ "$count" -ge "$peak" ]] && continue
-
     case "$role" in
       zeek-extract) svc=filebeat ;;
       publisher|mover) svc=pcap-monitor ;;
@@ -433,7 +428,29 @@ check_threads() {
 
     local drained
     drained=$(docker logs --since 5m "$(drain_container "$svc")" 2>&1 | grep -cE '🖅|📫|🖄' || true)
-    [[ "${drained:-0}" -gt 0 ]] && continue   # lost a thread but still working
+
+    # LEARN THE PEAK ONLY FROM A WATCHER THAT IS DEMONSTRABLY WORKING.
+    #
+    # The first version recorded whatever it saw first, and that made the check
+    # useless in the one case it was written for: the mover was ALREADY degraded
+    # (2 threads, nothing drained since 18:43) when the peak was learned, so the
+    # peak was recorded as 2, the loss became invisible, and the check stayed
+    # silent through a live stall. A baseline sampled during the fault is not a
+    # baseline.
+    #
+    # Requiring drain events means the peak can only ever be set from a healthy
+    # observation. The cost is that a watcher which is broken from the moment the
+    # state is cleared has no baseline until it works once - which is the right
+    # way round, because a missing baseline reports nothing rather than
+    # reporting a wrong one.
+    pstate="${STATE_DIR}/threads.${role}"
+    peak=0; [[ -f "$pstate" ]] && peak=$(cat "$pstate" 2>/dev/null || echo 0)
+    if [[ "${drained:-0}" -gt 0 ]]; then
+      [[ "$count" -gt "$peak" ]] && echo "$count" > "$pstate"
+      continue                                # working: nothing to report
+    fi
+    [[ "$peak" -eq 0 ]] && continue           # no healthy baseline yet
+    [[ "$count" -ge "$peak" ]] && continue    # threads intact; the queue checks cover the rest
 
     report "WATCHER THREAD LOST: ${role} has ${count} threads (peak ${peak}) and produced no events in 5m"
     if [[ "$HEAL" -eq 1 ]]; then
