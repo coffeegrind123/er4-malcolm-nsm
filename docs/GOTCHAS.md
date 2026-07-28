@@ -525,6 +525,26 @@ More generally: the measurement perturbs the thing measured, and on a quiet home
 network the perturbation can dominate. Establish what your own tooling
 contributes before drawing conclusions about anything else.
 
+### The PCAP archive grows without bound by default
+`pcap/processed` is never pruned in practice. `ARKIME_FREESPACEG` only triggers
+when free space drops below the threshold, and on a large disk that is years
+away — measured growth here was 223 → 434 captures in 17 hours, unbounded.
+
+That directory is what `pcap_watcher` polls every cycle, and **scan cost tracks
+file count, not bytes**. A size-based cap does not fix it: at ~5 MB per capture,
+even a 300 GB limit leaves ~56,000 files in one directory.
+
+`tools/prune-pcap` bounds it by time (`PCAP_RETENTION_DAYS`, default 14). It
+removes the `arkime_files` index entries *before* deleting the files, so the UI
+never offers a download for a capture that has already gone.
+
+Age is taken from the capture timestamp in the filename, never mtime — the
+re-queue repair rewrites mtimes, which would make a freshly repaired capture
+look new and exempt it permanently.
+
+Session metadata is untouched and keeps its own 90-day retention. Losing a raw
+capture costs the packet bytes for an old session, not the session.
+
 ### The silent watcher stalls: what is known, and what is not
 Recurring across `pcap-monitor` (mover and publisher) and `filebeat`'s extractor.
 Roughly one every 2-4 hours. `tools/watchdog --heal` contains them with no data

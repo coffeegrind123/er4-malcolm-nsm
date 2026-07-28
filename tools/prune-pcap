@@ -1,0 +1,80 @@
+#!/usr/bin/env bash
+# Time-bound the raw PCAP archive.
+#
+#   tools/prune-pcap            delete captures older than PCAP_RETENTION_DAYS
+#   tools/prune-pcap --dry-run  show what would go, delete nothing
+#
+# Why time and not size. Arkime's own ARKIME_FREESPACEG prunes on free space,
+# which on a large disk never triggers - and even when it does, it caps bytes
+# rather than file count. At ~5 MB per capture a 300 GB cap still leaves ~56,000
+# files in one directory, and pcap/processed is polled by pcap_watcher on every
+# cycle. Scan cost tracks the file COUNT, so only a time bound actually holds it
+# still.
+#
+# What this does NOT touch: session metadata in OpenSearch, which has its own
+# 90-day ISM policy. Pruning here costs you the ability to pull raw packets for
+# an old session; the session, its fields and every dashboard still work.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -f "${REPO_ROOT}/config.env" ]] && source "${REPO_ROOT}/config.env"
+
+DAYS="${PCAP_RETENTION_DAYS:-14}"
+PCAP_MOUNT="${PCAP_MOUNT:-//d/malcolm-data/pcap}"
+OSAPI="${REPO_ROOT}/tools/osapi"
+DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
+
+say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()  { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+
+say "PCAP retention: ${DAYS} days$( [[ $DRY -eq 1 ]] && echo '  (dry run)')"
+
+# Age comes from the capture timestamp in the filename, not mtime. mtime is
+# rewritten by the re-queue repair that clears stranded files, which would make
+# a freshly-repaired capture look brand new and exempt it forever.
+CUTOFF=$(date -u -d "${DAYS} days ago" +%Y%m%d%H%M%S)
+ok "deleting captures with a timestamp before ${CUTOFF}"
+
+LIST=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c "
+  for f in /p/processed/*.pcap; do
+    [ -f \"\$f\" ] || continue
+    b=\$(basename \"\$f\")
+    ts=\$(echo \"\$b\" | sed -n 's/.*\\(20[0-9]\\{6\\}\\)-\\([0-9]\\{6\\}\\).*/\\1\\2/p')
+    [ -n \"\$ts\" ] || continue
+    [ \"\$ts\" -lt ${CUTOFF} ] && echo \"\$b\"
+  done" 2>/dev/null || true)
+
+COUNT=$(printf '%s' "$LIST" | grep -c . || true)
+TOTAL=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c 'ls -1 /p/processed/*.pcap 2>/dev/null | wc -l' 2>/dev/null || echo 0)
+
+if [[ "${COUNT:-0}" -eq 0 ]]; then
+  ok "nothing older than ${DAYS} days (${TOTAL} captures retained)"
+  exit 0
+fi
+
+ok "${COUNT} of ${TOTAL} captures are older than ${DAYS} days"
+printf '%s\n' "$LIST" | head -3 | sed 's/^/      /'
+[[ "$COUNT" -gt 3 ]] && echo "      ... and $((COUNT - 3)) more"
+
+if [[ $DRY -eq 1 ]]; then
+  say "Dry run - nothing deleted."
+  exit 0
+fi
+
+# Remove Arkime's index entries first. Doing it the other way round leaves a
+# window where the UI offers a PCAP download for a file that is already gone.
+printf '%s\n' "$LIST" | while read -r b; do
+  [[ -n "$b" ]] || continue
+  "$OSAPI" es POST 'arkime_files/_delete_by_query' \
+    "{\"query\":{\"wildcard\":{\"name\":\"*${b}\"}}}" >/dev/null 2>&1 || true
+done
+ok "arkime_files entries removed"
+
+printf '%s\n' "$LIST" | docker run --rm -i -v "${PCAP_MOUNT}:/p" alpine sh -c '
+  n=0; while read -r b; do
+    [ -n "$b" ] || continue
+    rm -f "/p/processed/$b" && n=$((n+1))
+  done; echo "    deleted $n capture files"'
+
+REMAIN=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c 'echo "$(ls -1 /p/processed/*.pcap 2>/dev/null | wc -l) files, $(du -sh /p/processed 2>/dev/null | cut -f1)"' 2>/dev/null)
+ok "archive now: ${REMAIN}"
