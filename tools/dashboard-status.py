@@ -31,6 +31,7 @@ mount that is 60-100x slower than local disk, so:
 """
 from __future__ import annotations
 
+import calendar
 import json
 import os
 import pathlib
@@ -196,8 +197,8 @@ def probe_fs():
     The ratio to the settle window is what matters: once a directory scan takes
     longer than PCAP_PIPELINE_POLLING_ASSUME_CLOSED_SEC, the watcher is late by
     construction and it looks exactly like a stall."""
-    out = run(["docker", "logs", "--since", "30m", PROBE], timeout=25)
-    ld, entries, upload = [], 0, 0
+    out = run(["docker", "logs", "--since", "3h", PROBE], timeout=25)
+    ld, entries, upload, hist = [], 0, 0, []
     for line in out.splitlines():
         if '"k":"fs"' not in line:
             continue
@@ -207,6 +208,7 @@ def probe_fs():
             continue
         ld.append(d.get("listdir_us", 0) / 1000.0)
         entries, upload = d.get("entries", entries), d.get("upload", upload)
+        hist.append([d.get("t", 0), round(d.get("listdir_us", 0) / 1000), d.get("upload", 0)])
     if not ld:
         return {"available": False, "settle_sec": SETTLE_SEC}
     ld.sort()
@@ -216,6 +218,10 @@ def probe_fs():
     per95 = (pct(95) / entries) if entries else 0
     return {
         "available": True, "settle_sec": SETTLE_SEC, "entries": entries, "upload": upload,
+        # Downsampled series so the tiles can show a trend rather than a bare
+        # level. A number with no history cannot tell you whether it is a spike
+        # or the new normal, which is the difference between acting and waiting.
+        "history": hist[-60:],
         "listdir_p50_ms": round(pct(50)), "listdir_p95_ms": round(pct(95)), "listdir_max_ms": round(ld[-1]),
         "over_settle": sum(1 for v in ld if v > SETTLE_SEC * 1000), "samples": len(ld),
         "retain_files": retain, "projected_p95_s": round(per95 * retain / 1000, 1),
@@ -245,7 +251,13 @@ def queues():
         m = re.search(r"(20\d{6})-(\d{6})", head or "")
         if m:
             try:
-                age = int(time.time() - time.mktime(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")))
+                # timegm, NOT mktime. The capture timestamp in the filename is UTC,
+                # and mktime interprets a struct_time as LOCAL time - so on a host
+                # at UTC+3 every head age came out three hours too large. Measured:
+                # a capture processed 194 seconds after it was written reported as
+                # 10,994 seconds old, which was enough to put a false "head is old"
+                # warning in the console banner. A plausible number, silently wrong.
+                age = int(time.time() - calendar.timegm(time.strptime(m.group(1) + m.group(2), "%Y%m%d%H%M%S")))
             except Exception:
                 pass
         rows.append({"name": name, "pending": pending, "head": head, "head_age_sec": age})
@@ -280,7 +292,8 @@ def incidents():
             if not m:
                 continue
             try:
-                t = int(time.mktime(time.strptime(m.group(1), "%Y%m%dT%H%M%SZ")) - time.timezone)
+                # Same trap: the dump filenames are UTC (they end in Z).
+                t = calendar.timegm(time.strptime(m.group(1), "%Y%m%dT%H%M%SZ"))
             except Exception:
                 continue
             rows.append({"t": t, "label": m.group(2), "file": p.name})

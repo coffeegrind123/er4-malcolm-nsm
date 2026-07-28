@@ -317,6 +317,33 @@ and the service names from the ssl records, in one query. For a per-connection
 feed, do not show bytes at all; show the destination address and port, which are
 actually present on that record.
 
+### mktime reads a UTC timestamp as local time, and invents a problem
+
+The capture timestamp in a pcap filename is UTC. `time.mktime` interprets a
+`struct_time` as **local** time, so on a host at UTC+3 every queue head age came
+out three hours too large:
+
+```
+capture processed 194 seconds after it was written
+reported age: 10,994 seconds  (194 + exactly 3 hours)
+```
+
+That was enough to put `spool queues: upload head is 3.0h old` in the console
+banner and flag a warning state on a pipeline that was working perfectly. A
+plausible number, silently wrong, manufacturing an incident - which is worse than
+an obviously broken one, because someone goes looking for the cause.
+
+Use `calendar.timegm` for anything parsed out of a UTC filename. The bash tools
+were never affected because they use `date -u -d`, which is explicit about it -
+so the watchdog and the console disagreed, and the console was the one lying.
+
+Check it directly rather than trusting the number:
+
+```python
+time.time() - time.mktime(time.strptime(name, "%Y%m%d%H%M%S"))      # local: wrong
+time.time() - calendar.timegm(time.strptime(name, "%Y%m%d%H%M%S"))  # UTC: right
+```
+
 ### A dashboard where everything is equally loud says nothing
 
 The first console put thirteen panels in two undifferentiated grids at identical

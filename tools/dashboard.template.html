@@ -105,11 +105,18 @@
   .kpi .k{font-size:10px;color:var(--dim);text-transform:uppercase;letter-spacing:.8px}
   .kpi .v{font-size:17px;font-weight:600;margin:2px 0 1px;font-variant-numeric:tabular-nums}
   .kpi .s{font-size:11px}
+  .delta{font-size:10px;font-weight:600;margin-left:6px;padding:1px 5px;border-radius:8px;vertical-align:middle}
+  .delta.better{color:var(--ok);background:#2ea04318}
+  .delta.worse{color:var(--warn);background:#d2992218}
+  .delta.flat{color:var(--mute);background:#30363d55}
+  .tspark{display:block;width:100%;height:16px;margin:1px 0 2px}
   .kpi.problem{border-color:var(--warn)}
   .kpi.critical{border-color:var(--bad)}
   h2.sect{font-size:11px;color:var(--dim);text-transform:uppercase;letter-spacing:1.2px;
           margin:6px 0 -4px;padding-bottom:5px;border-bottom:1px solid var(--line);font-weight:600}
-  .tip{position:fixed;pointer-events:none;background:#21262d;border:1px solid var(--line);
+  .gl{border-bottom:1px dotted var(--dim);cursor:help}
+  .gl:hover{border-bottom-color:var(--accent);color:var(--accent)}
+  .tip{position:fixed;pointer-events:none;line-height:1.5;background:#21262d;border:1px solid var(--line);
        border-radius:5px;padding:4px 7px;font-size:11px;z-index:60;display:none;white-space:nowrap}
 </style>
 </head>
@@ -217,7 +224,7 @@ function table(cols, rows, opts = {}) {
   if (!rows.length) { const d = document.createElement("div"); d.className = "empty"; d.textContent = opts.empty || "no data in this window"; return d; }
   const max = Math.max(...rows.map(r => Number(r.bar) || 0), 1);
   const t = document.createElement("table");
-  t.innerHTML = `<thead><tr>${cols.map(c => `<th class="${c.num ? "num" : ""}">${esc(c.label)}</th>`).join("")}</tr></thead>`;
+  t.innerHTML = `<thead><tr>${cols.map(c => `<th class="${c.num ? "num" : ""}">${c.rawHead ? c.label : esc(c.label)}</th>`).join("")}</tr></thead>`;
   const tb = document.createElement("tbody");
   for (const r of rows) {
     const tr = document.createElement("tr");
@@ -299,9 +306,77 @@ function card(title, extra = "") {
    whole health section is one row - which is the point. Clicking any tile
    expands it anyway, so nothing is hidden, only de-emphasised. */
 const STATE_RANK = { ok: 0, warn: 1, bad: 2 };
+
+/* Change over the series, phrased so the direction is readable without knowing
+   whether up is good. "goodDown" says which way is healthy for this measure. */
+function deltaOf(series, fmt, goodDown) {
+  if (!series || series.length < 4) return {};
+  const a = series[0][1], b = series[series.length - 1][1];
+  const d = b - a;
+  if (!a || Math.abs(d) / Math.max(1, Math.abs(a)) < 0.05) return { delta: "steady", deltaDir: "flat" };
+  const worse = goodDown ? d > 0 : d < 0;
+  return { delta: (d > 0 ? "+" : "") + fmt(d), deltaDir: worse ? "worse" : "better" };
+}
 let FORCE_OPEN = {};
 
 function statusEl(state, word) { return `<span class="st ${state}">${esc(word)}</span>`; }
+
+/* GLOSSARY.
+   Nearly every label on this page is insider vocabulary - "queue-wedged
+   zeek-logs_upload", "settle window", "head age", "peak". Each one is a
+   compressed reference to a failure this deployment actually had, and it is
+   meaningless to anyone who was not there for it. A dashboard whose labels
+   require the author to explain them is not readable; it is a private notebook.
+   Hover any dotted term for the explanation. */
+const GLOSS = {
+  "thread-lost": "A watcher process lost one of its threads and stopped draining its queue. The container stays healthy and logs nothing, so this is invisible to docker. The watchdog restarts the service, which brings the thread back.",
+  "queue-wedged": "A spool directory stopped draining and the consumer produced no events at all, so the watchdog restarted it. Different from a backlog: a deep queue that is moving is fine and gets left alone.",
+  "zeek-logs_upload": "The queue where Zeek drops its log tarballs for filebeat to unpack and index. If it stops draining, network metadata stops reaching the index while packet capture carries on regardless.",
+  "pcap_upload": "The queue where freshly captured pcap files land before the mover takes them to be analysed. Stalls here mean traffic is on disk but nothing is looking at it.",
+  "verification-test": "A forensics dump taken by hand to check the collection works, not a real incident.",
+  "filter-check": "A forensics dump taken by hand while fixing the probe's process matching, not a real incident.",
+  "head age": "How old the OLDEST waiting item is - taken from the capture timestamp in its filename, NOT how long it has been queued. The repair for a stuck queue re-presents old files under their original names, so a capture from hours ago can read as hours old while moving perfectly well. mtime is not used because that repair rewrites it.",
+  "settle window": "How long a file must sit unchanged before the watcher treats it as finished being written (10s). If one directory scan takes longer than this, the watcher is late by construction - and that looks exactly like a silent stall.",
+  "p95 directory scan": "The 95th-percentile time to list the capture directory on the Windows bind mount. That filesystem is 60-100x slower than local disk and degrades badly under load. Scan cost grows with the FILE COUNT, so it gets worse as the archive fills.",
+  "peak": "The highest thread count seen while this watcher was demonstrably working. Learned, never hardcoded - and only from a healthy observation, because a baseline sampled during a fault is not a baseline.",
+  "publisher": "Announces newly arrived captures to Zeek, Suricata and Arkime over ZMQ. When it stops, files keep moving across the disk but nothing analyses them.",
+  "mover": "Moves captures from the upload directory to the processed directory. When it stops, captures pile up in upload.",
+  "zeek-extract": "Unpacks the Zeek log tarballs so filebeat can index them.",
+  "quarantine": "Captures that could not be split or read at all. Nothing polls this directory, so anything here is unanalysed - it should normally be empty.",
+  "observer": "This destination is the monitoring's own traffic - an agent session or remote shell egressing from the network it is watching. Unlabelled it is usually the largest upload destination on the page and reads exactly like exfiltration.",
+  "unassigned shards": "Index data that is currently unavailable. On this deployment the usual cause is the host running out of memory, which OpenSearch reports as a corrupt index rather than as an out-of-memory error.",
+  "snapshots": "Point-in-time copies of the indices. A corrupted index cannot be repaired, only deleted - so a snapshot is the difference between losing an afternoon of sessions and losing all of them.",
+  "stalls healed": "Each entry is one incident the watchdog detected and repaired automatically, with a forensics dump taken BEFORE the repair - because restarting the fault is what destroyed the evidence for months.",
+  "available": "Memory the kernel says it could hand out, INCLUDING page cache it would have to reclaim first. It can look healthy while free memory is nearly exhausted.",
+  "free": "Memory that is immediately free right now. Watched alongside available because reclaiming cache here means reading back from a filesystem 60-100x slower than local disk.",
+};
+
+/* Wrap a term so it is visibly hoverable. Marked with a dotted underline: an
+   explanation nobody can tell is there does not help anyone. */
+function hint(text, key) {
+  const k = (key || text).toLowerCase();
+  const g = GLOSS[k] || Object.entries(GLOSS).find(([kk]) => k.includes(kk))?.[1];
+  if (!g) return esc(text);
+  return `<span class="gl" data-g="${esc(g)}">${esc(text)}</span>`;
+}
+
+/* One delegated listener rather than one per element - the health section is
+   re-rendered on every refresh tick. */
+document.addEventListener("mouseover", (e) => {
+  const t = e.target.closest?.(".gl");
+  const tip = document.getElementById("tip");
+  if (!t) return;
+  tip.style.display = "block";
+  tip.style.whiteSpace = "normal";
+  tip.style.maxWidth = "340px";
+  tip.textContent = t.dataset.g;
+  const r = t.getBoundingClientRect();
+  tip.style.left = Math.min(r.left, window.innerWidth - 360) + "px";
+  tip.style.top = (r.bottom + 8) + "px";
+});
+document.addEventListener("mouseout", (e) => {
+  if (e.target.closest?.(".gl")) document.getElementById("tip").style.display = "none";
+});
 
 /* Each entry returns: state, a headline value, a one-line reason, and a
    detail() that builds the full card only when it is actually needed. */
@@ -318,8 +393,11 @@ function healthItems() {
               : m.free_mb < m.floor_free_mb ? `only ${m.free_mb} MB free; reclaim is off a slow filesystem`
               : soon.length ? `reaches its floor in ~${Math.min(...soon)}m at the current slope`
               : "not falling";
-    out.push({ key: "memory", label: "host memory", state, why,
+    const memSeries = (t.samples || []).map(x => [x[0], x[1]]);
+    out.push({ key: "memory", label: "host memory", state, why, hintKey: "available",
       value: `${(m.avail_mb / 1024).toFixed(1)} GB`, unit: "available",
+      series: memSeries,
+      ...deltaOf(memSeries, (d) => `${(d / 1024).toFixed(1)} GB`, false),
       detail: () => {
         const d = document.createDocumentFragment();
         d.append(el(`<div class="sub">${m.free_mb} MB free (floor ${m.floor_free_mb}) &middot; swap ${m.swap_pct}% &middot; available floor ${m.floor_avail_mb} MB</div>`));
@@ -340,14 +418,15 @@ function healthItems() {
   { /* watchers */
     const w = s.watchers || [], down = w.filter(x => x.degraded);
     const state = down.length ? "bad" : w.some(x => x.age_sec < 120) ? "warn" : "ok";
-    out.push({ key: "watchers", label: "watchers", state,
+    out.push({ key: "watchers", label: "watchers", state, hintKey: "peak",
       value: `${w.length - down.length}/${w.length}`, unit: "healthy",
       why: down.length ? `${down.map(x => x.role).join(", ")} lost a thread - the queue stops draining`
          : w.some(x => x.age_sec < 120) ? "a watcher is still starting" : "all threads present",
       detail: () => table(
-        [{ key: "role", label: "watcher" }, { key: "th", label: "threads", num: true },
+        [{ key: "role", label: "watcher", raw: true }, { key: "th", label: "threads / peak", num: true, raw: true },
          { key: "up", label: "uptime", num: true }, { key: "st", label: "state", raw: true }],
-        w.map(x => ({ role: x.role, th: `${x.threads}${x.peak ? " / " + x.peak : ""}`, up: dur(x.age_sec),
+        w.map(x => ({ role: hint(x.role, x.role),
+          th: `${x.threads}${x.peak ? " / " + hint(String(x.peak), "peak") : ""}`, up: dur(x.age_sec),
           st: statusEl(x.degraded ? "bad" : x.age_sec < 120 ? "warn" : "ok",
                        x.degraded ? "thread lost" : x.age_sec < 120 ? "starting" : "ok") }))) });
   }
@@ -357,14 +436,17 @@ function healthItems() {
     const quar = q.find(x => x.name === "quarantine");
     const old = q.filter(x => x.pending > 0 && x.head_age_sec > 900);
     const state = (quar && quar.pending > 0) ? "warn" : old.length ? "warn" : "ok";
-    out.push({ key: "queues", label: "spool queues", state,
+    const qSeries = ((s.fs || {}).history || []).map(h => [h[0], h[2]]);
+    out.push({ key: "queues", label: "spool queues", state, hintKey: "quarantine",
       value: q.reduce((a, x) => a + x.pending, 0), unit: "pending",
+      series: qSeries,
+      ...deltaOf(qSeries, (d) => `${Math.round(d)}`, true),
       why: (quar && quar.pending > 0) ? `${quar.pending} capture(s) in quarantine - unanalysed`
          : old.length ? `${old[0].name} head is ${dur(old[0].head_age_sec)} old` : "everything draining",
       detail: () => table(
-        [{ key: "name", label: "queue" }, { key: "p", label: "pending", num: true },
-         { key: "age", label: "head age", num: true }, { key: "st", label: "state", raw: true }],
-        q.map(x => ({ name: x.name, p: x.pending, age: x.head_age_sec >= 0 ? dur(x.head_age_sec) : "-",
+        [{ key: "name", label: "queue", raw: true }, { key: "p", label: "pending", num: true },
+         { key: "age", label: hint("head age", "head age"), num: true, rawHead: true }, { key: "st", label: "state", raw: true }],
+        q.map(x => ({ name: hint(x.name, x.name), p: x.pending, age: x.head_age_sec >= 0 ? dur(x.head_age_sec) : "-",
           st: statusEl(x.pending === 0 ? "ok" : x.head_age_sec > 900 ? "warn" : "ok",
                        x.pending === 0 ? "empty" : x.head_age_sec > 900 ? "head is old" : "moving") }))) });
   }
@@ -374,8 +456,11 @@ function healthItems() {
     const state = !f.available ? "warn"
                 : f.projected_p95_s > f.settle_sec ? "warn"
                 : f.listdir_p95_ms > f.settle_sec * 1000 ? "warn" : "ok";
-    out.push({ key: "fs", label: "scan latency", state,
+    const fsSeries = (f.history || []).map(h => [h[0], h[1]]);
+    out.push({ key: "fs", label: "scan latency", state, hintKey: "p95 directory scan",
       value: f.available ? `${(f.listdir_p95_ms / 1000).toFixed(1)}s` : "-", unit: "p95 directory scan",
+      series: fsSeries,
+      ...deltaOf(fsSeries, (d) => `${Math.round(d)} ms`, true),
       why: !f.available ? "stall probe not running - tools/stall-probe start"
          : f.projected_p95_s > f.settle_sec
            ? `projects to ${f.projected_p95_s}s at full retention, past the ${f.settle_sec}s settle window`
@@ -394,7 +479,7 @@ function healthItems() {
     const stale = sn.available && sn.latest_age_sec > 172800;
     const state = !cl.reachable ? "bad" : cl.status === "red" ? "bad"
                 : (cl.status !== "green" || stale || !sn.available) ? "warn" : "ok";
-    out.push({ key: "index", label: "index & recovery", state,
+    out.push({ key: "index", label: "index & recovery", state, hintKey: "snapshots",
       value: cl.reachable ? (cl.docs || 0).toLocaleString() : "-", unit: "documents",
       why: !cl.reachable ? "cluster unreachable"
          : cl.status !== "green" ? `cluster ${cl.status}, ${cl.unassigned} shard(s) unassigned`
@@ -415,7 +500,7 @@ function healthItems() {
     const inc = s.incidents || [];
     const now = Date.now() / 1000;
     const recent = inc.filter(i => now - i.t < 3600).length;
-    out.push({ key: "stalls", label: "stalls healed", state: recent > 3 ? "warn" : "ok",
+    out.push({ key: "stalls", label: "stalls healed", hintKey: "stalls healed", state: recent > 3 ? "warn" : "ok",
       value: inc.length, unit: recent ? `${recent} in the last hour` : "all time",
       why: recent > 3 ? `${recent} in the last hour - well above the usual rate`
          : inc.length ? `most recent ${dur(Math.round(now - inc[inc.length - 1].t))} ago` : "none recorded",
@@ -423,8 +508,14 @@ function healthItems() {
         const by = {};
         inc.forEach(i => { const k = i.label.replace(/^(thread-lost|queue-wedged)-/, "$1 "); by[k] = (by[k] || 0) + 1; });
         const d = document.createDocumentFragment();
-        d.append(table([{ key: "k", label: "kind" }, { key: "n", label: "count", num: true }],
-          Object.entries(by).sort((x, y) => y[1] - x[1]).map(([k, n]) => ({ k, n, bar: n }))));
+        /* Each kind is compressed jargon for a specific failure - annotate both
+           halves ("queue-wedged" and which queue) rather than leaving the reader
+           to decode "queue-wedged zeek-logs_upload". */
+        d.append(table([{ key: "k", label: "kind", raw: true }, { key: "n", label: "count", num: true }],
+          Object.entries(by).sort((x, y) => y[1] - x[1]).map(([k, n]) => {
+            const parts = k.split(" ");
+            return { k: parts.map(w => hint(w, w)).join(" "), n, bar: n };
+          })));
         d.append(el(`<div class="sub">each one is a forensics dump taken before the repair, in <code>$STATE_DIR/forensics</code></div>`));
         return d;
       } });
@@ -456,9 +547,23 @@ function renderHealth() {
         esc(items.map(i => i.label + " " + String(i.value) + " " + i.unit).slice(0, 3).join(" &middot; ").replace(/&middot;/g, "·"))}</span>`;
 
   for (const it of items) {
+    /* A level with no history cannot tell you whether it is a spike or the new
+       normal - which is the difference between acting now and waiting. Where a
+       series exists, the tile carries its shape and its change. */
+    const spark = it.series && it.series.length > 3
+      ? `<svg class="tspark" viewBox="0 0 100 100" preserveAspectRatio="none"><path d="${
+          (() => {
+            const ys = it.series.map(p => p[1]);
+            const lo = Math.min(...ys), hi = Math.max(...ys, lo + 1);
+            return it.series.map((p, i) =>
+              `${i ? "L" : "M"}${(i / (it.series.length - 1) * 100).toFixed(1)},${(100 - (p[1] - lo) / (hi - lo) * 100).toFixed(1)}`).join(" ");
+          })()}" fill="none" stroke="var(--accent)" stroke-width="1.5" vector-effect="non-scaling-stroke" opacity="0.75"/></svg>`
+      : "";
     const t = el(`<div class="kpi ${it.state === "bad" ? "critical" : it.state === "warn" ? "problem" : ""}">
-      <div class="k">${esc(it.label)}</div>
-      <div class="v">${esc(String(it.value))} <span class="muted" style="font-size:11px;font-weight:400">${esc(it.unit)}</span></div>
+      <div class="k">${it.hintKey ? hint(it.label, it.hintKey) : esc(it.label)}</div>
+      <div class="v">${esc(String(it.value))} <span class="muted" style="font-size:11px;font-weight:400">${esc(it.unit)}</span>${
+        it.delta ? `<span class="delta ${it.deltaDir}">${esc(it.delta)}</span>` : ""}</div>
+      ${spark}
       <div class="s">${statusEl(it.state, it.state === "ok" ? "ok" : it.why.length > 44 ? it.why.slice(0, 42) + "…" : it.why)}</div>
     </div>`);
     t.title = it.why;
