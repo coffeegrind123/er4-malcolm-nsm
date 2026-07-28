@@ -302,6 +302,36 @@ flow reuses one socket. Aggregate `cardinality` on `source.port` alongside the
 date histogram — `tools/investigate` does this, and without it every Tailscale
 tunnel and long-poll connection reads as malicious.
 
+### The bundled GeoIP database is from 2019
+Not "a bit out of date" - `logstash-filter-geoip` vendors GeoLite2 databases
+built **2019-11-18**, because MaxMind's licence change that year stopped the
+plugin shipping refreshed copies. The file mtime shows the *image* build date
+and looks recent, which is how this hides.
+
+Reallocated ranges resolve to their previous owners. Confirmed against RDAP:
+
+| IP | 2019 database | actual |
+|---|---|---|
+| `91.98.9.143` | AS16322 Pars Online (IR) | Hetzner Online GmbH (DE) |
+| `46.225.42.92` | AS56402 Dadeh Gostar (IR) | Hetzner Online GmbH (DE) |
+
+Two German cloud ranges reading as Iranian ISPs is exactly the finding that
+sends you hunting an intrusion that does not exist.
+
+`tools/update-geoip` installs a current DB-IP Lite ASN database - no licence key,
+monthly refresh, self-identifies as GeoLite2-compatible. Check what you have with
+`tools/update-geoip --check`.
+
+**ASN only.** DBIP-City-Lite parses fine standalone but the logstash geoip filter
+reads nothing usable from it: country enrichment measured **0%** against 37% on
+the vendored database, with no error logged either way. City stays on the stale
+copy. Acceptable, because a correct ASN organisation already answers the
+question - "Hetzner Online GmbH" tells you it is not Iran whatever the country
+field claims.
+
+Only NEW documents get corrected enrichment; already-indexed documents keep what
+the database said when they were written.
+
 ### The bundled GeoIP database is stale
 GeoLite2 still maps some reallocated ranges to their previous holders — e.g.
 Hetzner's `91.98.0.0/16` and `46.225.32.0/20` resolve to Iranian ISPs, which

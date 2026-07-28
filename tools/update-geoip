@@ -1,0 +1,97 @@
+#!/usr/bin/env bash
+# Replace Logstash's ASN database with a current one.
+#
+#   tools/update-geoip            download and install
+#   tools/update-geoip --check    report the installed database's build date
+#
+# Why this exists: the GeoLite2 databases vendored inside logstash-filter-geoip
+# were built **2019-11-18**. MaxMind's licence change that year stopped the
+# plugin shipping refreshed copies, so every Malcolm deployment carries a
+# ~7-year-old view of who owns which address block. That is not a rounding
+# error - reallocated ranges resolve to their *previous* owners:
+#
+#   91.98.9.143   2019 db: AS16322 Pars Online (IR)   truth: Hetzner (DE)
+#   46.225.42.92  2019 db: AS56402 Dadeh Gostar (IR)  truth: Hetzner (DE)
+#
+# Both were confirmed against RDAP. Two Hetzner ranges reading as Iranian ISPs
+# is exactly the kind of finding that sends you chasing an intrusion that is not
+# there.
+#
+# DB-IP Lite is used rather than MaxMind because it needs no account or licence
+# key, refreshes monthly, and its ASN database self-identifies as
+# GeoLite2-compatible.
+#
+# ASN ONLY, deliberately. DBIP-City-Lite parses correctly standalone, but the
+# logstash geoip filter reads nothing usable from it - country enrichment
+# measured 0% against 37% on the vendored database. City therefore stays on the
+# stale bundled copy. That is an acceptable trade: with the ASN organisation
+# correct, "Hetzner Online GmbH" already tells you it is not Iran, whatever the
+# stale country field says.
+set -euo pipefail
+
+REPO_ROOT="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
+[[ -f "${REPO_ROOT}/config.env" ]] && source "${REPO_ROOT}/config.env"
+
+GEO_DIR_WIN="${GEOIP_DIR_WIN:-//d/malcolm-data/geoip}"
+MONTH="${GEOIP_MONTH:-$(date -u +%Y-%m)}"
+VENDOR_PATH="/usr/share/logstash/vendor/bundle/jruby/3.4.0/gems/logstash-filter-geoip-8.0.0-java/vendor/GeoLite2-ASN.mmdb"
+
+say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()  { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+die() { printf '    \033[31mFAIL\033[0m %s\n' "$*" >&2; exit 1; }
+
+if [[ "${1:-}" == "--check" ]]; then
+  say "Installed ASN database"
+  docker run --rm -v "${GEO_DIR_WIN}:/g" python:3.13-slim sh -c '
+    pip install -q maxminddb 2>/dev/null
+    python3 -c "
+import maxminddb, datetime, os
+p=\"/g/dbip-asn.mmdb\"
+if not os.path.exists(p):
+    print(\"    no DB-IP database installed - logstash is using the 2019 vendored copy\"); raise SystemExit
+r=maxminddb.open_database(p); m=r.metadata()
+b=datetime.datetime.fromtimestamp(m.build_epoch, datetime.timezone.utc)
+age=(datetime.datetime.now(datetime.timezone.utc)-b).days
+print(f\"    {m.database_type}  built {b:%Y-%m-%d}  ({age} days old)\")
+"' 2>/dev/null
+  exit 0
+fi
+
+say "Fetching DB-IP ASN database (${MONTH})"
+docker run --rm -v "${GEO_DIR_WIN}:/g" alpine sh -c "
+  apk add -q curl gzip 2>/dev/null
+  curl -sfL 'https://download.db-ip.com/free/dbip-asn-lite-${MONTH}.mmdb.gz' -o /g/asn.gz" \
+  || die "download failed - if the month just rolled over, try GEOIP_MONTH=$(date -u -d '1 month ago' +%Y-%m)"
+
+docker run --rm -v "${GEO_DIR_WIN}:/g" alpine sh -c '
+  apk add -q gzip 2>/dev/null
+  gunzip -f /g/asn.gz && mv /g/asn /g/dbip-asn.mmdb' || die "extract failed"
+ok "installed to ${GEO_DIR_WIN}/dbip-asn.mmdb"
+
+# Sanity-check against a range that is known to have changed hands. If this
+# still reports the old owner, the download is not what it claims to be.
+say "Verifying"
+docker run --rm -v "${GEO_DIR_WIN}:/g" python:3.13-slim sh -c '
+  pip install -q maxminddb 2>/dev/null
+  python3 -c "
+import maxminddb, datetime
+r=maxminddb.open_database(\"/g/dbip-asn.mmdb\"); m=r.metadata()
+b=datetime.datetime.fromtimestamp(m.build_epoch, datetime.timezone.utc)
+print(f\"    built {b:%Y-%m-%d}\")
+d=r.get(\"91.98.9.143\") or {}
+org=d.get(\"autonomous_system_organization\",\"?\")
+print(f\"    91.98.9.143 -> {org}\")
+print(\"    OK\" if \"Hetzner\" in org else \"    WARNING: still reports the pre-reallocation owner\")
+"' 2>/dev/null
+
+cat <<EOF
+
+    Mounted over the vendored copy via docker-compose.override.yml at:
+      ${VENDOR_PATH}
+
+    Apply with:
+      cd \$MALCOLM_DIR && docker compose --profile malcolm up -d logstash
+
+    Only NEW documents are enriched with the corrected data - already-indexed
+    documents keep whatever the database said when they were written.
+EOF
