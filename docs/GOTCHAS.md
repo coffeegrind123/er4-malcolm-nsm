@@ -344,6 +344,34 @@ time.time() - time.mktime(time.strptime(name, "%Y%m%d%H%M%S"))      # local: wro
 time.time() - calendar.timegm(time.strptime(name, "%Y%m%d%H%M%S"))  # UTC: right
 ```
 
+### Filtering out your own stack: BPF cannot do it, and that is the whole problem
+
+The instinct on seeing the capturing machine dominate its own capture is to drop
+that traffic at the sensor. BPF matches addresses, ports and protocols - never
+names - and every service the stack talks to (package registries, telemetry,
+container pulls, the agent API) sits behind CDN addresses that rotate. An
+IP-based exclusion works the day it is written and then silently stops, which is
+the worst outcome: the view still looks filtered.
+
+The names only exist further up, in the TLS SNI Zeek extracts, so that is where
+the filtering belongs. `INFRA_DOMAINS` is a substring list the console hides by
+default, with a toggle to show it. The traffic is still captured and indexed, so
+nothing is lost and the decision is reversible.
+
+Push the exclusion INTO the query, not after it: a top-10 list with the noise
+removed afterwards is really a top-6. For a per-device breakdown use a filtered
+sub-aggregation rather than a regex `exclude`, so the device's total session
+count still covers everything while only its service list is filtered.
+
+**Two traps.** An `exclude` built from an empty list is an empty regex, and
+OpenSearch answers that with a 500 - which is what happens on first paint if the
+panels are built before the status feed has loaded. And an IP-keyed panel cannot
+be filtered by domain at all, because those documents carry no name; exclude the
+observer's known addresses directly there instead.
+
+Measured on this deployment: about 20% of the collector's named connections were
+its own infrastructure, and on one occasion the observer was 79% of all upload.
+
 ### A dashboard where everything is equally loud says nothing
 
 The first console put thirteen panels in two undifferentiated grids at identical

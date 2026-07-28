@@ -328,6 +328,9 @@ def main():
         "refresh_sec": int(os.environ.get("DASHBOARD_REFRESH_SECS", "60")),
         "observer_dests": [d for d in (os.environ.get("OBSERVER_DESTS", "") or "").replace(",", " ").split() if d],
         # ip -> friendly name, so the console can say "desktop" not "192.168.1.50"
+        # Substring patterns for the monitoring stack's own traffic. Display-level
+        # on purpose - see config.env.example for why BPF cannot do this.
+        "infra_domains": [d.strip() for d in (os.environ.get("INFRA_DOMAINS", "") or "").split(",") if d.strip()],
         "device_names": dict(
             kv.split("=", 1) for kv in
             (os.environ.get("DEVICE_NAMES", "") or "").split(",")

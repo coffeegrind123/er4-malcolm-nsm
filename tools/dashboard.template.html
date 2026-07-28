@@ -134,6 +134,9 @@
       <option value="7d">7d</option>
     </select>
   </label>
+  <label class="muted" title="Hide traffic from the monitoring stack and the host's own housekeeping">
+    <input type="checkbox" id="infra"> show our own stack
+  </label>
   <button id="refresh">refresh</button>
   <a href="/arkime/" target="_blank">Arkime</a>
   <a href="/dashboards/" target="_blank">Dashboards</a>
@@ -583,6 +586,29 @@ function renderHealth() {
 
 /* ---------- network (live queries) --------------------------------------- */
 function isObserver(ip) { return (STATUS?.observer_dests || []).includes(ip); }
+
+/* THE OBSERVER PROBLEM, generalised.
+   The machine doing the capturing is on the network it captures, and its own
+   housekeeping - package registries, telemetry, container pulls, the agent
+   session - is indistinguishable from user traffic at the address level. Left
+   in, it is routinely the loudest thing on the page: measured here at 79% of all
+   upload on one occasion, and ~20% of the collector's named connections today.
+   That noise is the single most common reason a capture of your own network is
+   less useful than it should be.
+   Hidden by default, one toggle away, and still fully captured and indexed -
+   this filters the VIEW, never the data. */
+const SHOW_INFRA = () => document.getElementById("infra").checked;
+function isInfra(domain) {
+  if (!domain) return false;
+  return (STATUS?.infra_domains || []).some(p => domain.includes(p));
+}
+/* Push it into the query where possible, so the buckets themselves are clean
+   rather than filtered after the fact - a top-10 list with the noise removed
+   afterwards is really a top-6. */
+function infraMustNot() {
+  if (SHOW_INFRA() || !STATUS) return [];
+  return (STATUS.infra_domains || []).map(p => ({ wildcard: { "server.domain": `*${p}*` } }));
+}
 /* Show a configured name where there is one, and ALWAYS keep the address
    visible next to it - a friendly label that turns out to be attached to the
    wrong device is worse than no label, and this mapping is hand-written. */
@@ -608,7 +634,8 @@ async function renderActivity() {
       _source: ["@timestamp", "source.ip", "server.domain", "destination.ip",
                 "destination.port", "client.bytes", "server.bytes"],
       query: { bool: {
-        filter: [{ range: { "@timestamp": { gte: "now-" + RANGE } } }, { exists: { field: "server.domain" } }] } },
+        filter: [{ range: { "@timestamp": { gte: "now-" + RANGE } } }, { exists: { field: "server.domain" } }],
+        must_not: infraMustNot() } },
     });
     const rows = (r.hits?.hits || []).map(h => {
       const d = h._source, src = d.source?.ip || "?";
@@ -642,7 +669,12 @@ async function renderActivity() {
       size: 0,
       query: { bool: { filter: [{ range: { "@timestamp": { gte: "now-" + RANGE } } }] } },
       aggs: { dev: { terms: { field: "source.ip", size: 12, order: { _count: "desc" } },
-              aggs: { svc: { terms: { field: "server.domain", size: 6 } },
+              /* A filtered sub-aggregation, not a regex exclude: the top-level
+                 count stays every session for the device, while the service
+                 chips drop the infrastructure. An exclude built from an empty
+                 list is an empty regex, which OpenSearch rejects with a 500. */
+              aggs: { svc: { filter: { bool: { must_not: infraMustNot() } },
+                             aggs: { d: { terms: { field: "server.domain", size: 6 } } } },
                       up: { sum: { field: "client.bytes" } },
                       down: { sum: { field: "server.bytes" } } } } },
     });
@@ -657,7 +689,7 @@ async function renderActivity() {
         </div>
         <div style="margin-top:3px;font-size:11px;line-height:1.7"></div></div>`);
       const chips = row.querySelector("div:last-child");
-      for (const sv of b.svc.buckets) {
+      for (const sv of b.svc.d.buckets) {
         const c = el(`<span class="tag" style="background:#1f6feb22;color:var(--accent);cursor:pointer;margin:0 5px 0 0;
                         text-transform:none;font-size:11px;letter-spacing:0">${esc(sv.key)} <span class="muted">${sv.doc_count}</span></span>`);
         c.onclick = () => openDrill("server.domain", sv.key);
@@ -676,10 +708,19 @@ async function termsPanel(body, { field, dataset, metric, label, valueFmt, extra
   const filter = [timeFilter()];
   if (dataset) filter.push({ term: { "event.dataset": dataset } });
   if (extraFilter) filter.push(...extraFilter);
+  /* An IP-keyed panel cannot be filtered by domain - there is no name on those
+     documents. The observer's addresses ARE stable and known, though, so exclude
+     those directly; otherwise the monitoring's own egress stays the top row of
+     the upload table, which is the single most alarming-looking thing on the
+     page and is your own tooling. */
+  const mustNot = field === "server.domain" ? infraMustNot()
+    : (!SHOW_INFRA() && STATUS && field.endsWith(".ip") && (STATUS.observer_dests || []).length)
+      ? [{ terms: { [field]: STATUS.observer_dests } }]
+      : [];
   const aggs = metric
     ? { t: { terms: { field, size: 10, order: { m: "desc" } }, aggs: { m: { sum: { field: metric } } } } }
     : { t: { terms: { field, size: 10 } } };
-  const r = await es(`${IDX}/_search`, { size: 0, query: { bool: { filter } }, aggs });
+  const r = await es(`${IDX}/_search`, { size: 0, query: { bool: { filter, must_not: mustNot } }, aggs });
   const buckets = r.aggregations?.t?.buckets || [];
   return table(
     [{ key: "k", label: label || field, raw: true }, { key: "v", label: metric ? "bytes" : "count", num: true }],
@@ -890,14 +931,21 @@ function updateAge() {
   a.className = age > (STATUS.refresh_sec || 60) * 3 ? "stale" : "muted";
 }
 
-function start() {
+async function start() {
   RANGE = document.getElementById("range").value;
-  loadStatus(); renderNetwork();
+  /* AWAIT the status before building the network panels. Unawaited, they were
+     constructed while STATUS was still null - so the infrastructure filter, the
+     device names and the observer tags were all absent from the first paint, and
+     the empty filter list produced an invalid empty regex that returned HTTP 500.
+     The feed appeared to work only because it re-renders on the status tick. */
+  await loadStatus();
+  renderNetwork();
   clearInterval(timer); clearInterval(tick);
   timer = setInterval(loadStatus, (STATUS?.refresh_sec || 60) * 1000);
   tick = setInterval(updateAge, 5000);
 }
 document.getElementById("range").onchange = () => { RANGE = document.getElementById("range").value; renderNetwork(); };
+document.getElementById("infra").onchange = () => renderNetwork();
 document.getElementById("refresh").onclick = () => { loadStatus(); renderNetwork(); };
 start();
 </script>
