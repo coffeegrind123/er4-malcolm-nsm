@@ -350,6 +350,94 @@ function renderHealth() {
 
 /* ---------- network (live queries) --------------------------------------- */
 function isObserver(ip) { return (STATUS?.observer_dests || []).includes(ip); }
+/* Show a configured name where there is one, and ALWAYS keep the address
+   visible next to it - a friendly label that turns out to be attached to the
+   wrong device is worse than no label, and this mapping is hand-written. */
+function devName(ip) {
+  const n = (STATUS?.device_names || {})[ip];
+  return n ? `${esc(n)} <span class="muted" style="font-size:10px">${esc(ip)}</span>` : esc(ip);
+}
+const isLan = (ip) => /^(10\.|192\.168\.|172\.(1[6-9]|2\d|3[01])\.)/.test(ip || "");
+const clock = (ms) => new Date(ms).toLocaleTimeString([], { hour: "2-digit", minute: "2-digit", second: "2-digit" });
+
+/* THE QUESTION THIS DASHBOARD IS ACTUALLY FOR: what is each device doing.
+   Aggregate byte counts by IP answer a different question - useful for spotting
+   volume anomalies, useless for "is the PC on Twitch right now". */
+async function renderActivity() {
+  const feed = document.getElementById("feed-body");
+  const devs = document.getElementById("devices-body");
+  if (!feed) return;
+
+  /* live feed: most recent named connections, newest first */
+  panel(feed, async () => {
+    const r = await es(`${IDX}/_search`, {
+      size: 50, sort: [{ "@timestamp": "desc" }],
+      _source: ["@timestamp", "source.ip", "server.domain", "destination.ip",
+                "destination.port", "client.bytes", "server.bytes"],
+      query: { bool: {
+        filter: [{ range: { "@timestamp": { gte: "now-" + RANGE } } }, { exists: { field: "server.domain" } }] } },
+    });
+    const rows = (r.hits?.hits || []).map(h => {
+      const d = h._source, src = d.source?.ip || "?";
+      /* NO BYTE COLUMN HERE, deliberately. The record that carries the domain is
+         Zeek's ssl record and it has no byte fields at all - measured: 0 of 1412
+         such documents had client.bytes, server.bytes, network.bytes or
+         source.bytes. The bytes live on the separate conn record. Summing them
+         here produced a confident "0 B" on every row, which is the exact failure
+         this repo keeps meeting: a missing field rendering as a real-looking
+         number. Port and address are actually present, so show those. */
+      return {
+        t: clock(Date.parse(d["@timestamp"])),
+        who: devName(src),
+        svc: esc(d.server?.domain || "") + (isObserver(d.destination?.ip) ? ` <span class="tag obs">observer</span>` : ""),
+        dst: `${esc(d.destination?.ip || "")}<span class="muted">:${esc(d.destination?.port ?? "")}</span>`,
+        drill: { field: "server.domain", value: d.server?.domain },
+      };
+    });
+    return table([{ key: "t", label: "time", num: false }, { key: "who", label: "device", raw: true },
+                  { key: "svc", label: "connected to", raw: true }, { key: "dst", label: "address", raw: true }],
+                 rows, { empty: "no named connections in this window" });
+  });
+
+  /* per-device: what each LAN device talked to */
+  panel(devs, async () => {
+    /* NOT filtered on server.domain. The domain and the byte counts live on
+       DIFFERENT documents, so filtering to the ones with a domain zeroes every
+       byte total. Bucket all of the device's sessions, and let the svc sub-agg
+       pick up only those that carry a domain. */
+    const r = await es(`${IDX}/_search`, {
+      size: 0,
+      query: { bool: { filter: [{ range: { "@timestamp": { gte: "now-" + RANGE } } }] } },
+      aggs: { dev: { terms: { field: "source.ip", size: 12, order: { _count: "desc" } },
+              aggs: { svc: { terms: { field: "server.domain", size: 6 } },
+                      up: { sum: { field: "client.bytes" } },
+                      down: { sum: { field: "server.bytes" } } } } },
+    });
+    const wrap = document.createElement("div");
+    const buckets = (r.aggregations?.dev?.buckets || []).filter(b => isLan(b.key));
+    if (!buckets.length) return el(`<div class="empty">no LAN devices seen in this window</div>`);
+    for (const b of buckets) {
+      const row = el(`<div style="padding:7px 0;border-bottom:1px solid #21262d">
+        <div style="display:flex;justify-content:space-between;gap:10px;align-items:baseline">
+          <b style="font-size:13px">${devName(b.key)}</b>
+          <span class="muted" style="font-size:11px">${b.doc_count.toLocaleString()} sessions &middot; ${bytes(b.up.value || 0)} up / ${bytes(b.down.value || 0)} down</span>
+        </div>
+        <div style="margin-top:3px;font-size:11px;line-height:1.7"></div></div>`);
+      const chips = row.querySelector("div:last-child");
+      for (const sv of b.svc.buckets) {
+        const c = el(`<span class="tag" style="background:#1f6feb22;color:var(--accent);cursor:pointer;margin:0 5px 0 0;
+                        text-transform:none;font-size:11px;letter-spacing:0">${esc(sv.key)} <span class="muted">${sv.doc_count}</span></span>`);
+        c.onclick = () => openDrill("server.domain", sv.key);
+        chips.append(c);
+      }
+      const more = el(`<span class="muted" style="font-size:11px;cursor:pointer">all &rsaquo;</span>`);
+      more.onclick = () => openDrill("source.ip", b.key);
+      chips.append(more);
+      wrap.append(row);
+    }
+    return wrap;
+  });
+}
 
 async function termsPanel(body, { field, dataset, metric, label, valueFmt, extraFilter }) {
   const filter = [timeFilter()];
@@ -376,6 +464,20 @@ async function termsPanel(body, { field, dataset, metric, label, valueFmt, extra
 function renderNetwork() {
   const host = document.getElementById("network");
   host.innerHTML = "";
+
+  /* These two go first because they are the question a human actually asks:
+     which of my devices is talking to what, right now. */
+  const feed = card("live activity");
+  feed.body.id = "feed-body"; feed.body.innerHTML = `<div class="muted">loading…</div>`;
+  feed.card.style.gridColumn = "span 2";
+  host.append(feed.card);
+
+  const dev = card("devices");
+  dev.body.id = "devices-body"; dev.body.innerHTML = `<div class="muted">loading…</div>`;
+  dev.card.style.gridColumn = "span 2";
+  host.append(dev.card);
+
+  renderActivity();
   const mk = (title, note, fn) => {
     const { card: c, body } = card(title);
     host.append(c);
@@ -528,6 +630,9 @@ async function loadStatus() {
   } catch (e) { STATUS = null; }
   renderHealth();
   updateAge();
+  /* The feed is the "live" part - refresh it on the same tick as the health
+     data rather than only when the operator presses refresh. */
+  if (document.getElementById("feed-body")) renderActivity();
 }
 
 function updateAge() {

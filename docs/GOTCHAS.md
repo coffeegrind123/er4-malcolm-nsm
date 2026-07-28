@@ -288,6 +288,35 @@ Two traps when testing this with a headless browser:
   `<template>` and return the whole fragment; it also parses `<tr>` correctly,
   which a `<div>` wrapper does not.
 
+### The domain and the byte counts are on DIFFERENT documents
+
+Zeek's `ssl` record carries `server.domain` (the SNI) and has **no byte fields at
+all**. The bytes live on the separate `conn`/session record. Measured: of 1,412
+documents with `server.domain`, exactly **0** had `client.bytes`, `server.bytes`,
+`network.bytes` or `source.bytes`.
+
+So the natural way to build a "which device talked to which service, and how
+much" view is wrong twice, and both are silent:
+
+```js
+// per-connection row: sums a field that is never present
+vol: bytes((d.client?.bytes || 0) + (d.server?.bytes || 0))     // always "0 B"
+
+// per-device totals: filtering to docs WITH a domain excludes every doc
+// that has the bytes
+query: { filter: [ range, { exists: { field: "server.domain" } } ] },
+aggs:  { up: { sum: { field: "client.bytes" } } }               // always 0
+```
+
+Both render a confident `0 B` on every row. Nothing errors, and a zero is
+indistinguishable from a real measurement of nothing.
+
+Bucket **all** of a device's sessions and let a `server.domain` sub-aggregation
+pick out the ones that carry a domain - the sums then come from the conn records
+and the service names from the ssl records, in one query. For a per-connection
+feed, do not show bytes at all; show the destination address and port, which are
+actually present on that record.
+
 ### A failed query must not look like an empty result
 
 The recurring lesson of this whole deployment, and it applies hardest to a UI:

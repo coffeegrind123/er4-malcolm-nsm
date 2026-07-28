@@ -298,7 +298,14 @@ projected time-to-floor, watcher threads against their learned healthy peak,
 spool queue depth and head age, 9p scan latency against the settle window,
 cluster and snapshot state, and a count of every stall the watchdog has healed.
 
-**Bottom half — the network**, queried live: upload destinations (with
+**Live activity and devices** are the two panels for "what is my PC doing right
+now": a feed of the most recent named connections (time, device, domain,
+address) and a per-device breakdown of the services each LAN device talks to,
+with real byte totals. Set `DEVICE_NAMES` in `config.env` to see `desktop`
+instead of `192.168.1.50` — device names are barely present on the wire, so this
+is configured rather than guessed, and the address stays visible beside the name.
+
+**The rest of the network view**, queried live: upload destinations (with
 `OBSERVER_DESTS` rows tagged, or your own tooling tops the list), top talkers,
 TLS domains, DNS and NXDOMAIN, unanswered LLMNR/mDNS, Suricata alerts and
 destination ports. Click any row to drill in: volume and up/down ratio,

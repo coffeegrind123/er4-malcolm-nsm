@@ -314,6 +314,12 @@ def main():
         "generated": int(time.time()),
         "refresh_sec": int(os.environ.get("DASHBOARD_REFRESH_SECS", "60")),
         "observer_dests": [d for d in (os.environ.get("OBSERVER_DESTS", "") or "").replace(",", " ").split() if d],
+        # ip -> friendly name, so the console can say "desktop" not "192.168.1.50"
+        "device_names": dict(
+            kv.split("=", 1) for kv in
+            (os.environ.get("DEVICE_NAMES", "") or "").split(",")
+            if "=" in kv
+        ),
         "config": {
             "rotate_secs": int(os.environ.get("ROTATE_SECS", 120)),
             "pcap_retention_days": int(os.environ.get("PCAP_RETENTION_DAYS", 7)),
