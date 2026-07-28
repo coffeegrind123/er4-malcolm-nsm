@@ -109,6 +109,13 @@ a Linux host layout. This repo drives `docker compose` directly and performs the
 setup steps that script would otherwise have done (see
 [docs/GOTCHAS.md](docs/GOTCHAS.md)).
 
+Two settings are coupled and worth understanding before changing either:
+`ROTATE_SECS` and `PCAP_RETENTION_DAYS` multiply into the number of files in the
+polled archive, and both a too-long and a too-short rotation have their own
+failure mode. Captures over `MAX_PCAP_BYTES` are quarantined rather than
+ingested, because one oversized file deadlocks the whole pipeline. See
+`config.env.example` and [docs/USING.md](docs/USING.md#quarantined-captures).
+
 ## Security notes
 
 - nginx binds `0.0.0.0:443`, so the UI is reachable from the whole LAN, protected

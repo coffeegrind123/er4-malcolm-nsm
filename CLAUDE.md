@@ -78,6 +78,52 @@ If real data has already been pushed, rewriting history is not sufficient on its
 own — treat anything exposed (keys, tokens, passwords) as compromised and rotate
 it.
 
+## Definition of done — run this without being asked
+
+A change is not finished when the code works. Before saying it is done, do all
+four. Do not wait to be prompted, and do not just assert the result — show the
+check.
+
+**1. Docs and tools track the change.** If behaviour, a config key, a path or a
+failure mode changed, then in the same pass update `config.env.example` (the key
+*and* the reasoning), `README.md` if it affects setup or operation,
+`docs/USING.md` if an operator would need to do something about it, and
+`docs/GOTCHAS.md` if it cost real debugging time — symptom first, because the
+symptom is what the next person searches for. A new directory or artifact needs
+an owner: something must bound its growth, or it will grow forever in a place
+nobody looks.
+
+**2. Sanitisation, derived from local truth rather than memory.** Build the
+search terms from the gitignored files, so the check cannot miss a value nobody
+remembered to look for:
+
+```sh
+# needles from config.env / keys/, then scan TRACKED files only
+git ls-files -z | xargs -0 grep -n -F "$REAL_VALUE"          # must be empty
+git ls-files | grep -E 'config\.env$|^keys/|\.pcap$|\.pem$'  # must be empty
+```
+
+Placeholders (`192.168.1.x`, `203.0.113.x`, `//c/Users/YOU/...`) are expected in
+tracked files and are not hits. Real observed domains, private project names,
+device models and tailnet/host names count as private data just as much as an IP
+does — findings are published as technique, never as evidence.
+
+**3. Every negative result needs a control.** A clean grep proves nothing until
+the same command has found something you know is there. Run the control first
+and show it. This applies to any "not found", "no matches", "0 results" claim
+anywhere in this repo, not just sanitisation.
+
+**4. Verify against the remote, not the working tree.** A scrub after a push
+unpublishes nothing:
+
+```sh
+gh api repos/<owner>/<repo>/tarball/main | tar xz
+grep -rn "$REAL_VALUE" .    # with a control, per rule 3
+```
+
+If real data was already pushed, rewriting history is not sufficient — treat
+anything exposed as compromised and rotate it.
+
 ## Conventions
 
 - Scripts are idempotent; re-running is always safe.

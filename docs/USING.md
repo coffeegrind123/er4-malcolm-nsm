@@ -273,6 +273,28 @@ healthy — is invisible to `docker compose ps`, and costs you every packet
 captured until someone notices the graphs are flat. See
 [GOTCHAS.md](GOTCHAS.md).
 
+### Quarantined captures
+
+A single oversized capture deadlocks the mover and stops the whole pipeline, so
+`sensor/rotate.sh` diverts anything over `MAX_PCAP_BYTES` (default 50 MB) into
+`pcap/quarantine/` instead of queueing it. Nothing polls that directory, so a
+quarantined capture is **never analysed** — it is a deliberate blind spot traded
+for keeping the pipeline alive.
+
+```sh
+tools/prune-pcap --dry-run          # reports quarantine footprint on every run
+docker logs er4-sensor | grep quarantined
+```
+
+Check it occasionally. A steady trickle means `ROTATE_SECS` is too long for your
+burst traffic and you are silently dropping the most interesting captures; a
+sudden jump means something unusual happened on the network. To analyse one, move
+it back into `pcap/upload/` and watch — if it wedges the mover, `tools/watchdog
+--heal` recovers it.
+
+Quarantine has its own retention (`QUARANTINE_RETENTION_DAYS`, default 30 days —
+longer than the routine archive, because these are rare and kept deliberately).
+
 ## Reading the upload leaderboard
 
 `tools/investigate` ranks destinations by bytes **sent from** your network.

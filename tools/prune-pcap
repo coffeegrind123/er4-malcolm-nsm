@@ -27,6 +27,53 @@ DRY=0; [[ "${1:-}" == "--dry-run" ]] && DRY=1
 say() { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
 ok()  { printf '    \033[32mok\033[0m   %s\n' "$*"; }
 
+# Quarantine, from sensor/rotate.sh. Nothing else prunes it and nothing polls
+# it, so left alone it grows forever - the exact failure this script exists to
+# prevent, just in a directory nobody looks at.
+#
+# It gets its OWN, longer bound. These captures are quarantined because they are
+# anomalous, they are the only copy of whatever burst produced them, and they
+# are kept deliberately for manual handling - so they should outlive the routine
+# archive rather than share its retention.
+#
+# This runs on EVERY exit path, including "nothing to prune" and --dry-run.
+# Reporting the footprint unconditionally is the point: silent accumulation in a
+# directory nobody watches is what went wrong the first time.
+quarantine_pass() {
+  local qdays qstate qcutoff qdel
+  qdays="${QUARANTINE_RETENTION_DAYS:-30}"
+  qstate=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c \
+    'echo "$(ls -1 /p/quarantine/*.pcap 2>/dev/null | wc -l) files, $(du -sh /p/quarantine 2>/dev/null | cut -f1)"' 2>/dev/null)
+  ok "quarantine: ${qstate:-0 files} (retention ${qdays}d)"
+
+  qcutoff=$(date -u -d "${qdays} days ago" +%Y%m%d%H%M%S)
+  if [[ $DRY -eq 1 ]]; then
+    qdel=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c "
+      n=0
+      for f in /p/quarantine/*.pcap; do
+        [ -f \"\$f\" ] || continue
+        ts=\$(basename \"\$f\" | sed -n 's/.*\\(20[0-9]\\{6\\}\\)-\\([0-9]\\{6\\}\\).*/\\1\\2/p')
+        [ -n \"\$ts\" ] || continue
+        [ \"\$ts\" -lt ${qcutoff} ] && n=\$((n+1))
+      done
+      echo \$n" 2>/dev/null || echo 0)
+    [[ "${qdel:-0}" -gt 0 ]] && ok "quarantine: ${qdel} capture(s) would be deleted"
+    return 0
+  fi
+
+  qdel=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c "
+    n=0
+    for f in /p/quarantine/*.pcap; do
+      [ -f \"\$f\" ] || continue
+      ts=\$(basename \"\$f\" | sed -n 's/.*\\(20[0-9]\\{6\\}\\)-\\([0-9]\\{6\\}\\).*/\\1\\2/p')
+      [ -n \"\$ts\" ] || continue
+      [ \"\$ts\" -lt ${qcutoff} ] && rm -f \"\$f\" && n=\$((n+1))
+    done
+    echo \$n" 2>/dev/null || echo 0)
+  [[ "${qdel:-0}" -gt 0 ]] && ok "quarantine: deleted ${qdel} capture(s) older than ${qdays}d"
+  return 0
+}
+
 say "PCAP retention: ${DAYS} days$( [[ $DRY -eq 1 ]] && echo '  (dry run)')"
 
 # Age comes from the capture timestamp in the filename, not mtime. mtime is
@@ -49,6 +96,7 @@ TOTAL=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c 'ls -1 /p/processed/*
 
 if [[ "${COUNT:-0}" -eq 0 ]]; then
   ok "nothing older than ${DAYS} days (${TOTAL} captures retained)"
+  quarantine_pass
   exit 0
 fi
 
@@ -58,6 +106,7 @@ printf '%s\n' "$LIST" | head -3 | sed 's/^/      /'
 
 if [[ $DRY -eq 1 ]]; then
   say "Dry run - nothing deleted."
+  quarantine_pass
   exit 0
 fi
 
@@ -78,3 +127,5 @@ printf '%s\n' "$LIST" | docker run --rm -i -v "${PCAP_MOUNT}:/p" alpine sh -c '
 
 REMAIN=$(docker run --rm -v "${PCAP_MOUNT}:/p" alpine sh -c 'echo "$(ls -1 /p/processed/*.pcap 2>/dev/null | wc -l) files, $(du -sh /p/processed 2>/dev/null | cut -f1)"' 2>/dev/null)
 ok "archive now: ${REMAIN}"
+
+quarantine_pass
