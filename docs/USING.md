@@ -260,6 +260,32 @@ and confirm the window contains anything at all. The `from`/`to` parsing on
 **Verify enrichment against an authoritative source** before acting on it.
 GeoIP and ASN attribution are the usual culprits — see above.
 
+## Starting and stopping
+
+```sh
+tools/nsm start     tools/nsm stop     tools/nsm status
+tools/nsm enable    tools/nsm disable  tools/nsm purge --yes
+```
+
+**The order matters going down, which is why this is a script rather than a
+note.** `tools/watchdog --heal` exists to restart things that stop, so stopping
+the sensor or the stack while it runs means it faithfully puts them back — the
+shutdown appears to half-succeed and then undo itself. The healing loops die
+first.
+
+`enable` installs the router key and starts everything; `disable` stops
+everything and removes the key, then proves it by *failing* to authenticate —
+reading the config back is not proof, since an already-open session still works.
+Password login to the router is untouched either way, so you are never locked
+out.
+
+`purge` deletes captures, indices, logs and snapshots. It keeps two things
+deliberately: the GeoIP database (downloaded, not captured) and the OpenSearch
+keystore (a credential store, and a bind-mount source that compose requires to
+pre-exist — deleting it makes the *next* start fail on a mount error that says
+nothing about the purge). It recreates every directory Malcolm expects, derived
+from the compose file rather than a hand-written list that would go stale.
+
 ## Keeping it running
 
 ```sh

@@ -1,0 +1,291 @@
+#!/usr/bin/env bash
+# One control surface for the whole deployment.
+#
+#   tools/nsm start     bring everything up (stack, sensor, probe, loops)
+#   tools/nsm stop      take everything down, in the order that actually works
+#   tools/nsm status    what is running, in one screen
+#   tools/nsm enable    install the router key, then start
+#   tools/nsm disable   stop, then remove the router key
+#   tools/nsm purge     DELETE all captured data (asks first)
+#
+# WHY THIS EXISTS
+#
+# Starting and stopping this deployment by hand is a sequence with a trap in it,
+# and getting the order wrong looks like the tooling failing rather than the
+# operator. Both directions are encoded here so neither has to be remembered.
+#
+# THE TRAP, going down: tools/watchdog --heal exists to restart things that stop.
+# Stop the sensor or the stack while it is running and it will faithfully put
+# them back, so a shutdown appears to half-succeed and then undo itself. The
+# healing loops must die FIRST.
+#
+# THE OTHER TRAP: killing those loops with `pkill -f <pattern>` matches the
+# killing command's own argv, so the shell running it dies mid-script and the
+# rest never executes. That is why the loops write PID files and this stops them
+# by PID. (Learned by doing it.)
+#
+# Going up, the order is reversed and matters less, but the stack needs to be
+# accepting writes before the sensor starts feeding it.
+set -uo pipefail
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+REPO="$(cd "${HERE}/.." && pwd)"
+. "${HERE}/_config.sh"
+
+MALCOLM_DIR="${MALCOLM_DIR:-${HOME}/malcolm}"
+COMPOSE_PROJECT="${COMPOSE_PROJECT:-$(basename "$MALCOLM_DIR")}"
+SENSOR_CONTAINER="${SENSOR_CONTAINER:-er4-sensor}"
+PROBE_CONTAINER="${PROBE_CONTAINER:-er4-stall-probe}"
+STATE_DIR="${STATE_DIR:-${TMPDIR:-/tmp}/er4-watchdog}"
+DATA_WIN="${DATA_ROOT_WIN:-//d/malcolm-data}"
+WATCHDOG_INTERVAL="${WATCHDOG_INTERVAL:-300}"
+DASH_INTERVAL="${DASHBOARD_REFRESH_SECS:-60}"
+mkdir -p "$STATE_DIR"
+
+say()  { printf '\n\033[1m==> %s\033[0m\n' "$*"; }
+ok()   { printf '    \033[32mok\033[0m   %s\n' "$*"; }
+warn() { printf '    \033[33mwarn\033[0m %s\n' "$*"; }
+die()  { printf '    \033[31mfail\033[0m %s\n' "$*" >&2; exit 1; }
+
+# ---- the background loops ----------------------------------------------------
+# PID files rather than pattern matching, for the reason in the header.
+loop_start() { # loop_start <name> <interval> <command...>
+  local name="$1" interval="$2"; shift 2
+  local pidf="${STATE_DIR}/${name}.pid"
+  if [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null; then
+    ok "${name} already running (pid $(cat "$pidf"))"; return 0
+  fi
+  nohup setsid bash -c '
+    while true; do "$@" >/dev/null 2>&1; sleep "$0"; done
+  ' "$interval" "$@" >/dev/null 2>&1 &
+  echo $! > "$pidf"
+  ok "${name} started (pid $(cat "$pidf"), every ${interval}s)"
+}
+
+loop_stop() { # loop_stop <name>
+  # Separate statements, deliberately. Bash expands every word of a `local`
+  # before performing any of its assignments, so a later item referencing an
+  # earlier one on the SAME line sees it unset - and under `set -u` that aborts
+  # the whole shutdown at its very first step.
+  local name="$1"
+  local pidf="${STATE_DIR}/${name}.pid"
+  local pid
+  [[ -f "$pidf" ]] || { ok "${name} not running"; return 0; }
+  pid=$(cat "$pidf" 2>/dev/null || echo "")
+  if [[ -n "$pid" ]] && kill -0 "$pid" 2>/dev/null; then
+    # Kill the process GROUP: the loop's current child (a sleep, or a watchdog
+    # mid-run) would otherwise survive and finish its work after we declared the
+    # thing stopped.
+    kill -TERM -- "-${pid}" 2>/dev/null || kill -TERM "$pid" 2>/dev/null
+    sleep 1
+    kill -0 "$pid" 2>/dev/null && kill -KILL -- "-${pid}" 2>/dev/null
+    ok "${name} stopped (pid ${pid})"
+  else
+    ok "${name} not running (stale pid file)"
+  fi
+  rm -f "$pidf"
+}
+
+loop_state() { # -> "running (pid N)" | "stopped"
+  local pidf="${STATE_DIR}/$1.pid"
+  if [[ -f "$pidf" ]] && kill -0 "$(cat "$pidf" 2>/dev/null)" 2>/dev/null
+  then echo "running (pid $(cat "$pidf"))"; else echo "stopped"; fi
+}
+
+# ---- start / stop ------------------------------------------------------------
+cmd_start() {
+  say "starting the analysis stack"
+  (cd "$MALCOLM_DIR" && docker compose --profile malcolm up -d >/dev/null 2>&1) \
+    || die "could not start Malcolm - check ${MALCOLM_DIR}"
+  # Wait for it to accept writes before feeding it, or the first captures arrive
+  # at a cluster that is still recovering.
+  local n=0
+  until [[ "$("${HERE}/osapi" es GET '_cluster/health?filter_path=status' 2>/dev/null | grep -c '"status"')" -eq 1 ]] || [[ $n -ge 30 ]]; do
+    sleep 10; n=$((n + 1))
+  done
+  ok "cluster responding: $("${HERE}/osapi" es GET '_cluster/health?filter_path=status' 2>/dev/null || echo unknown)"
+
+  say "starting capture"
+  (cd "${REPO}/sensor" && docker compose --env-file "${REPO}/config.env" \
+     -f docker-compose.sensor.yml up -d >/dev/null 2>&1) \
+    || warn "sensor container did not start"
+  # "The container is running" is not "capture is working". With the router key
+  # removed the sensor comes up perfectly and then fails authentication in a
+  # retry loop forever - reporting that as success is the exact class of lie
+  # this repo keeps finding. Read the log and say which it is.
+  sleep 8
+  if docker logs --tail 20 "$SENSOR_CONTAINER" 2>&1 | grep -q 'Permission denied'; then
+    warn "sensor is running but CANNOT AUTHENTICATE to the router - no traffic is being captured"
+    warn "install the key with: tools/nsm enable"
+  elif docker ps --format '{{.Names}}' | grep -qx "$SENSOR_CONTAINER"; then
+    ok "sensor running and authenticated"
+  fi
+
+  say "console"
+  # The page lives on the data volume, so a purge removes it. Rebuilding is
+  # cheap and idempotent, and skipping it leaves nginx serving a 500 that looks
+  # like a broken deployment.
+  "${HERE}/dashboard" build >/dev/null 2>&1 && ok "console rendered" \
+    || warn "console not rendered - run: tools/dashboard install"
+
+  say "starting monitoring"
+  "${HERE}/stall-probe" start >/dev/null 2>&1 && ok "stall probe sampling" || warn "stall probe did not start"
+  loop_start watchdog "$WATCHDOG_INTERVAL" "${HERE}/watchdog" --heal
+  loop_start dashboard "$DASH_INTERVAL" "${HERE}/dashboard" status
+  echo
+  ok "console: ${MALCOLM_BASE:-https://localhost}/nsm/"
+}
+
+cmd_stop() {
+  # ORDER IS LOAD-BEARING. The healing loops go first or they undo everything
+  # below them - see the header.
+  say "stopping the healing loops first"
+  loop_stop watchdog
+  loop_stop dashboard
+
+  say "stopping capture"
+  docker stop "$SENSOR_CONTAINER" >/dev/null 2>&1 && ok "sensor stopped" || ok "sensor was not running"
+  "${HERE}/stall-probe" stop >/dev/null 2>&1 && ok "stall probe stopped" || true
+
+  say "stopping the analysis stack"
+  (cd "$MALCOLM_DIR" && docker compose --profile malcolm stop >/dev/null 2>&1) || true
+  # A container that is already dead can abort compose's sequence part-way
+  # through, leaving the rest running while the command reports failure. Sweep
+  # up individually rather than trusting one exit code.
+  local left
+  left=$(docker ps --format '{{.Names}}' 2>/dev/null | grep "^${COMPOSE_PROJECT}-" || true)
+  if [[ -n "$left" ]]; then
+    while read -r c; do
+      [[ -n "$c" ]] && docker stop -t 30 "$c" >/dev/null 2>&1 && ok "stopped ${c}"
+    done <<<"$left"
+  fi
+  ok "everything down"
+  cmd_status
+}
+
+cmd_status() {
+  say "state"
+  local up
+  up=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE "^${COMPOSE_PROJECT}-" || true)
+  printf '    %-22s %s\n' "analysis stack" "${up} container(s) running"
+  printf '    %-22s %s\n' "capture sensor" \
+    "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$SENSOR_CONTAINER" && echo running || echo stopped)"
+  printf '    %-22s %s\n' "stall probe" \
+    "$(docker ps --format '{{.Names}}' 2>/dev/null | grep -qx "$PROBE_CONTAINER" && echo running || echo stopped)"
+  printf '    %-22s %s\n' "watchdog loop" "$(loop_state watchdog)"
+  printf '    %-22s %s\n' "console refresh" "$(loop_state dashboard)"
+  if [[ "${up:-0}" -gt 0 ]]; then
+    printf '    %-22s %s\n' "cluster" \
+      "$("${HERE}/osapi" es GET '_cluster/health?filter_path=status,unassigned_shards' 2>/dev/null || echo unreachable)"
+  fi
+  printf '    %-22s %s\n' "captured data" \
+    "$(docker run --rm -v "${DATA_WIN}:/d" alpine du -sh /d 2>/dev/null | cut -f1 || echo unknown)"
+}
+
+# ---- router --------------------------------------------------------------
+cmd_enable() {
+  say "installing the sensor key on the router"
+  bash "${REPO}/router/prepare-router.sh" || die "router setup failed"
+  cmd_start
+}
+
+cmd_disable() {
+  cmd_stop
+  say "removing the sensor key from the router"
+  # Through the EdgeOS config tree, never authorized_keys: EdgeOS regenerates
+  # that file from its config on every commit, so a raw edit reappears.
+  ssh -i "${REPO}/keys/sensor_key" -o UserKnownHostsFile="${REPO}/keys/known_hosts" \
+      -o StrictHostKeyChecking=yes -o PubkeyAcceptedKeyTypes=+ssh-rsa \
+      -o HostKeyAlgorithms=+ssh-rsa -o ConnectTimeout=20 -o BatchMode=yes \
+      "${ROUTER_USER}@${ROUTER_HOST}" 'bash -c "
+source /opt/vyatta/etc/functions/script-template
+configure
+delete system login user '"${ROUTER_USER}"' authentication public-keys malcolm-sensor
+commit
+save
+exit
+"' >/dev/null 2>&1 && ok "key deleted and config saved" || warn "could not reach the router (already disabled?)"
+
+  # Verify by FAILING to authenticate. Reading the config back is not proof - it
+  # would still succeed from an already-open session.
+  if timeout 25 ssh -i "${REPO}/keys/sensor_key" -o UserKnownHostsFile="${REPO}/keys/known_hosts" \
+       -o StrictHostKeyChecking=yes -o PubkeyAcceptedKeyTypes=+ssh-rsa -o HostKeyAlgorithms=+ssh-rsa \
+       -o ConnectTimeout=15 -o BatchMode=yes -o PasswordAuthentication=no \
+       -o NumberOfPasswordPrompts=0 "${ROUTER_USER}@${ROUTER_HOST}" true 2>/dev/null; then
+    warn "the key STILL authenticates - capture could be resumed without you"
+  else
+    ok "verified: the sensor key no longer authenticates"
+  fi
+  echo
+  ok "password login is untouched, so you are not locked out"
+  ok "re-enable with: tools/nsm enable"
+}
+
+# ---- purge -------------------------------------------------------------------
+cmd_purge() {
+  local force=0; [[ "${1:-}" == "--yes" ]] && force=1
+  say "captured data in ${DATA_WIN}"
+  docker run --rm -v "${DATA_WIN}:/d" alpine sh -c 'du -sh /d/* 2>/dev/null | sort -rh | head -12' | sed 's/^/    /'
+
+  if [[ "$force" -ne 1 ]]; then
+    echo
+    warn "This deletes captures, indices, logs AND snapshots. It cannot be undone."
+    warn "Config and keys are untouched. Re-run with --yes to proceed."
+    return 1
+  fi
+
+  local up
+  up=$(docker ps --format '{{.Names}}' 2>/dev/null | grep -cE "^${COMPOSE_PROJECT}-|^${SENSOR_CONTAINER}$" || true)
+  [[ "${up:-0}" -gt 0 ]] && die "stop everything first: tools/nsm stop"
+
+  say "deleting"
+  # Contents, not the directories: Malcolm's bind mounts expect these paths to
+  # exist and be owned by uid 1000. Removing the directory itself makes the next
+  # start fail with a permissions error that looks unrelated.
+  # KEEP THE KEYSTORE. It is a credential store, not captured data, and it is a
+  # bind-mount source that compose declares create_host_path:false - so deleting
+  # it makes the NEXT start fail on a mount error that says nothing about the
+  # purge that caused it. Found by testing the round trip rather than assuming.
+  docker run --rm -v "${DATA_WIN}:/d" alpine sh -c '
+    cp -a /d/opensearch/opensearch.keystore /tmp/ks 2>/dev/null
+    for d in pcap zeek-logs suricata-logs filescan-logs opensearch opensearch-backup \
+             netbox postgres valkey _tmp dashboard; do
+      [ -d "/d/$d" ] || continue
+      find "/d/$d" -mindepth 1 -delete 2>/dev/null
+      echo "    cleared $d"
+    done
+    mkdir -p /d/opensearch
+    cp -a /tmp/ks /d/opensearch/opensearch.keystore 2>/dev/null && echo "    keystore preserved"' 2>/dev/null
+
+  # Recreate EVERY directory compose expects, derived from compose itself rather
+  # than from a list here - a hand-written list silently goes stale the moment
+  # Malcolm adds a mount, and the failure surfaces as an unrelated-looking
+  # permissions error on a later start.
+  local paths
+  paths=$(grep -oE "source: ${DATA_WIN}/[^ ]+" "${MALCOLM_DIR}/docker-compose.yml" 2>/dev/null \
+          | sed "s|source: ${DATA_WIN}/||" | grep -v 'keystore' | sort -u)
+  docker run --rm -i -v "${DATA_WIN}:/d" alpine sh -c '
+    while read -r p; do [ -n "$p" ] && mkdir -p "/d/$p"; done
+    mkdir -p /d/pcap/processed /d/pcap/quarantine /d/pcap/staging /d/zeek-logs/current
+    chown -R 1000:1000 /d 2>/dev/null
+    echo "    recreated $(find /d -mindepth 1 -maxdepth 2 -type d | wc -l) directories, owned by uid 1000"' \
+    <<<"$paths" 2>/dev/null
+
+  # GeoIP is deliberately kept: it is a downloaded database, not captured data,
+  # and re-fetching it needs the network and a few minutes.
+  ok "geoip database kept - it is not capture data"
+  rm -f "${STATE_DIR}"/*.samples "${STATE_DIR}"/threads.* "${STATE_DIR}"/*.restarted 2>/dev/null
+  rm -rf "${STATE_DIR}/forensics" "${STATE_DIR}/dashboard-cache" 2>/dev/null
+  ok "watchdog state and forensics cleared"
+  say "remaining"
+  docker run --rm -v "${DATA_WIN}:/d" alpine du -sh /d 2>/dev/null | sed 's/^/    /'
+}
+
+case "${1:-status}" in
+  start)   shift; cmd_start "$@" ;;
+  stop)    shift; cmd_stop "$@" ;;
+  status)  shift; cmd_status "$@" ;;
+  enable)  shift; cmd_enable "$@" ;;
+  disable) shift; cmd_disable "$@" ;;
+  purge)   shift; cmd_purge "$@" ;;
+  *) sed -n '2,9p' "${BASH_SOURCE[0]}" | sed 's/^# \{0,1\}//' ;;
+esac

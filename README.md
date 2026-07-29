@@ -119,6 +119,12 @@ pieces and queued — never discarded. See `config.env.example` and
 ### Keeping it alive
 
 ```sh
+tools/nsm start          # bring the whole thing up
+tools/nsm stop           # take it down (healing loops first, or they undo it)
+tools/nsm status         # what is running, one screen
+tools/nsm enable         # install the router key, then start
+tools/nsm disable        # stop, then remove the router key and verify it fails
+tools/nsm purge --yes    # delete all captured data
 ./install.sh ops         # snapshots, console and stall probe, in one go
 tools/dashboard install  # one page for pipeline health + network, at https://<host>/nsm/
 tools/watchdog --heal    # detect and repair silent watcher stalls; run on a timer
